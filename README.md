@@ -41,4 +41,18 @@ anything is sent.
 ## Status
 
 `schema/`, `skill/rubric.md`, and `docs/data-handling.md` are frozen (S0). `skill/SKILL.md`,
-`mcp/`, and `upload.sh` are in progress (S3). See the dispatch packet in the MinuteWork monorepo.
+`mcp/` (the submit MCP + clean-room two-layer redaction lib), and `upload.sh` (the bootstrap)
+are implemented (S3) and ship **Claude + Codex first**; Cursor is best-effort behind a format
+probe (its chat store is binary, not plaintext). The live submit/authorize endpoints are
+provided by the MinuteWork platform + public-dj (S1/S2). See the dispatch packet in the
+MinuteWork monorepo.
+
+### Build & test the MCP
+
+```
+cd mcp
+npm install
+npm run typecheck      # tsc, no emit
+npm run build          # tsc -> dist/ + vendor the frozen schema
+npm test               # node --test (redaction + schema + dry-run + submit)
+```

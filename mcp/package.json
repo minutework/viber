@@ -1,0 +1,38 @@
+{
+  "name": "@viber/mcp",
+  "version": "1.0.0",
+  "description": "viber submit MCP: validates a Verifiable AI-Builder profile against the frozen allowlist schema (client-side, ajv) and POSTs it to the public-dj ingest endpoint with a signed submission token. The ONLY thing this tool transmits is a single schema-valid profile JSON; raw transcripts and source code never leave the machine.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "viber-mcp": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "schema"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node ./scripts/copy-schema.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test tests/*.test.ts"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
+  }
+}
