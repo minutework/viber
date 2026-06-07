@@ -14,9 +14,11 @@
 #   1. Detects installed coding agents (cursor-agent / codex / claude) and the
 #      one you are logged into; instructs you if none is logged in.
 #   2. Fetches the viber skill.
-#   3. Opens your browser to the platform GitHub-OAuth authorize page and mints a
-#      short-lived signed submission token to a local loopback listener (the
-#      token never touches disk; it is passed to the agent via env only).
+#   3. Runs a PKCE loopback handoff against the MinuteWork platform: opens your
+#      browser to the platform GitHub-OAuth start URL, receives a single-use
+#      authorization code on a local 127.0.0.1 listener, then exchanges that code
+#      (with the PKCE verifier) for a short-lived signed submission token. The
+#      token never touches disk; it is passed to the agent via env only.
 #   4. Registers the viber submit MCP (npx, token in env).
 #   5. Headlessly invokes the chosen agent (claude -p / codex exec /
 #      cursor-agent -p) pointed at the skill, READ-ONLY / least-privilege.
@@ -35,10 +37,18 @@ set -euo pipefail
 # --------------------------------------------------------------------------- #
 VIBER_BASE_URL="${VIBER_BASE_URL:-https://viber.minutework.ai}"
 VIBER_PUBLIC_DJ_BASE_URL="${VIBER_PUBLIC_DJ_BASE_URL:-https://viber.minutework.ai}"
-VIBER_AUTHORIZE_URL="${VIBER_AUTHORIZE_URL:-${VIBER_BASE_URL}/authorize}"
+# MinuteWork platform (control plane) that owns the GitHub-OAuth PKCE handoff and
+# mints the signed submission token. Distinct host from the public-dj ingest API.
+VIBER_PLATFORM_BASE_URL="${VIBER_PLATFORM_BASE_URL:-https://platform.minutework.ai}"
+# Real S1 endpoints (override the whole URL only for non-default deployments).
+VIBER_OAUTH_START_URL="${VIBER_OAUTH_START_URL:-${VIBER_PLATFORM_BASE_URL}/api/v1/developer/builder-profile/oauth/github/start/}"
+VIBER_TOKEN_EXCHANGE_URL="${VIBER_TOKEN_EXCHANGE_URL:-${VIBER_PLATFORM_BASE_URL}/api/v1/developer/builder-profile/submission-token/exchange/}"
 VIBER_SKILL_URL="${VIBER_SKILL_URL:-${VIBER_BASE_URL}/skill/SKILL.md}"
 VIBER_MCP_PACKAGE="${VIBER_MCP_PACKAGE:-@viber/mcp}"
-VIBER_LOOPBACK_PORT="${VIBER_LOOPBACK_PORT:-0}"   # 0 => pick a free port
+# Loopback listener port. Default 0 => pick a free port. S1 requires the
+# redirect_uri to carry an EXPLICIT port (http://127.0.0.1:<port>/callback), which
+# this script always sends regardless of how the port was chosen.
+VIBER_LOOPBACK_PORT="${VIBER_LOOPBACK_PORT:-0}"
 
 # --------------------------------------------------------------------------- #
 # Args
@@ -56,7 +66,8 @@ Options:
   -h, --help                     Show this help.
 
 Environment overrides:
-  VIBER_BASE_URL, VIBER_PUBLIC_DJ_BASE_URL, VIBER_AUTHORIZE_URL,
+  VIBER_BASE_URL, VIBER_PUBLIC_DJ_BASE_URL, VIBER_PLATFORM_BASE_URL,
+  VIBER_OAUTH_START_URL, VIBER_TOKEN_EXCHANGE_URL,
   VIBER_SKILL_URL, VIBER_MCP_PACKAGE, VIBER_LOOPBACK_PORT
 USAGE
 }
@@ -95,23 +106,6 @@ warn() { printf '\033[1;33m[viber]\033[0m %s\n' "$*" >&2; }
 err() { printf '\033[1;31m[viber]\033[0m %s\n' "$*" >&2; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
-
-# Minimal RFC 3986 percent-encoding for a redirect_uri query value.
-urlencode() {
-  raw="$1"
-  out=""
-  i=0
-  len=${#raw}
-  while [ "$i" -lt "$len" ]; do
-    c="${raw:$i:1}"
-    case "$c" in
-      [a-zA-Z0-9.~_-]) out="${out}${c}" ;;
-      *) out="${out}$(printf '%%%02X' "'$c")" ;;
-    esac
-    i=$((i + 1))
-  done
-  printf '%s' "$out"
-}
 
 os_family() {
   case "$(uname -s 2>/dev/null)" in
@@ -249,101 +243,195 @@ if ! curl -fsSL "$VIBER_SKILL_URL" -o "${SKILL_DIR}/SKILL.md"; then
 fi
 
 # --------------------------------------------------------------------------- #
-# 3. Browser GitHub-OAuth → signed submission token on a loopback listener
+# 3. PKCE GitHub-OAuth loopback handoff → signed submission token (S1 flow)
 # --------------------------------------------------------------------------- #
-# The platform authorize page performs GitHub OAuth and then redirects the
-# browser to http://127.0.0.1:<port>/callback?token=<signed-submission-token>.
-# A tiny local listener captures that token. The token is held ONLY in this
-# shell's environment and is never written to disk.
+# Real S1 contract (PLATFORM, not a single /authorize page):
+#   1. Generate a PKCE code_verifier + S256 code_challenge (base64url, no pad).
+#   2. Bind a 127.0.0.1 loopback listener on an EXPLICIT port; redirect_uri is
+#      http://127.0.0.1:<port>/callback (S1 normalizes/enforces loopback).
+#   3. Open the browser to the START url with query params S1 expects:
+#        redirect_uri=<callback>&code_challenge=<challenge>
+#      (S1 generates `state` server-side; the callback delivers ?code=<code>.)
+#   4. Receive the single-use authorization CODE at the callback.
+#   5. POST {code, code_verifier, redirect_uri} to the EXCHANGE endpoint and read
+#      the signed `submission_token` (+ `expires_in`) from the JSON response.
+# The whole listener+exchange runs inside one python3 process so the PKCE verifier
+# never leaves memory and the final token never touches disk on the wire path.
+# The token is held ONLY in this shell's environment afterward.
 SUBMIT_TOKEN=""
 
 mint_submit_token() {
   if ! have python3; then
-    warn "python3 not found; cannot run the loopback token listener."
+    warn "python3 not found; cannot run the PKCE loopback listener + exchange."
     return 1
   fi
 
   TOKEN_FILE="${SCRATCH}/token"   # transient; in 700 scratch; removed on exit
   PORT_FILE="${SCRATCH}/port"
+  AUTHURL_FILE="${SCRATCH}/authurl"
   : >"$TOKEN_FILE"
   : >"$PORT_FILE"
+  : >"$AUTHURL_FILE"
 
-  # Launch the loopback listener in the BACKGROUND so we can open the browser
-  # while it waits. It binds 127.0.0.1 only (never 0.0.0.0), writes its bound
-  # port to PORT_FILE, captures the token to TOKEN_FILE on the single callback,
-  # then exits. Times out after 5 minutes.
+  # Launch the loopback listener + exchange in the BACKGROUND so we can open the
+  # browser while it waits. It binds 127.0.0.1 only (never 0.0.0.0), writes its
+  # bound port + the composed authorize URL out, captures the single-use code on
+  # the one callback, POSTs the PKCE exchange, and writes the resulting signed
+  # submission token to TOKEN_FILE, then exits. Times out after 5 minutes.
   VIBER_LOOPBACK_PORT="$VIBER_LOOPBACK_PORT" \
-    TOKEN_FILE="$TOKEN_FILE" PORT_FILE="$PORT_FILE" \
+    VIBER_OAUTH_START_URL="$VIBER_OAUTH_START_URL" \
+    VIBER_TOKEN_EXCHANGE_URL="$VIBER_TOKEN_EXCHANGE_URL" \
+    TOKEN_FILE="$TOKEN_FILE" PORT_FILE="$PORT_FILE" AUTHURL_FILE="$AUTHURL_FILE" \
     python3 - <<'PY' &
-import http.server, os, threading, time, urllib.parse
+import base64
+import hashlib
+import http.server
+import json
+import os
+import secrets
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 token_file = os.environ["TOKEN_FILE"]
 port_file = os.environ["PORT_FILE"]
+authurl_file = os.environ["AUTHURL_FILE"]
+start_url = os.environ["VIBER_OAUTH_START_URL"]
+exchange_url = os.environ["VIBER_TOKEN_EXCHANGE_URL"]
 want_port = int(os.environ.get("VIBER_LOOPBACK_PORT", "0") or "0")
+
+
+def b64url(raw):
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+# PKCE: high-entropy verifier; S256 challenge = base64url(sha256(verifier)), no pad.
+code_verifier = b64url(secrets.token_bytes(48))
+code_challenge = b64url(hashlib.sha256(code_verifier.encode("ascii")).digest())
+
+captured = {"code": "", "error": ""}
+done = threading.Event()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/callback":
+            self.send_response(404)
+            self.end_headers()
+            return
         params = urllib.parse.parse_qs(parsed.query)
-        token = (params.get("token") or [""])[0]
-        if token:
-            with open(token_file, "w", encoding="utf-8") as fh:
-                fh.write(token)
-            body = b"viber: token received. You can close this tab."
+        code = (params.get("code") or [""])[0]
+        error = (params.get("error") or [""])[0]
+        if code:
+            captured["code"] = code
+            body = b"viber: sign-in complete. You can close this tab."
         else:
-            body = b"viber: no token in callback."
+            captured["error"] = error or "no authorization code in callback"
+            body = b"viber: sign-in did not return an authorization code."
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(body)
+        done.set()
 
     def log_message(self, *args):
         pass
 
 
 httpd = http.server.HTTPServer(("127.0.0.1", want_port), Handler)
+bound_port = httpd.server_address[1]
+redirect_uri = "http://127.0.0.1:%d/callback" % bound_port
+
+# S1 expects redirect_uri + code_challenge as query params; state is server-side.
+authorize_url = "%s?%s" % (
+    start_url,
+    urllib.parse.urlencode(
+        {"redirect_uri": redirect_uri, "code_challenge": code_challenge}
+    ),
+)
+
 with open(port_file, "w", encoding="utf-8") as fh:
-    fh.write(str(httpd.server_address[1]))
+    fh.write(str(bound_port))
+with open(authurl_file, "w", encoding="utf-8") as fh:
+    fh.write(authorize_url)
 
 t = threading.Thread(target=httpd.serve_forever, daemon=True)
 t.start()
-deadline = time.time() + 300
-while time.time() < deadline:
-    if os.path.getsize(token_file) > 0:
-        time.sleep(0.2)  # let the response flush
-        break
-    time.sleep(0.25)
+done.wait(timeout=300)
+# Let the callback response flush before tearing the listener down.
+time.sleep(0.2)
 httpd.shutdown()
+
+if not captured["code"]:
+    raise SystemExit(0)
+
+# Exchange the single-use code for the signed submission token (PKCE verifier).
+payload = json.dumps(
+    {
+        "code": captured["code"],
+        "code_verifier": code_verifier,
+        "redirect_uri": redirect_uri,
+    }
+).encode("utf-8")
+request = urllib.request.Request(
+    exchange_url,
+    data=payload,
+    headers={"Content-Type": "application/json", "Accept": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        decoded = response.read().decode("utf-8")
+except urllib.error.HTTPError as exc:
+    detail = exc.read().decode("utf-8", "replace")[:500]
+    raise SystemExit("viber: token exchange failed (HTTP %s): %s" % (exc.code, detail))
+except urllib.error.URLError as exc:
+    raise SystemExit("viber: could not reach the token exchange endpoint: %s" % exc.reason)
+
+try:
+    body = json.loads(decoded)
+except json.JSONDecodeError:
+    raise SystemExit("viber: token exchange returned a malformed response.")
+
+token = str(body.get("submission_token") or "").strip()
+if not token:
+    raise SystemExit("viber: token exchange response had no submission_token.")
+
+with open(token_file, "w", encoding="utf-8") as fh:
+    fh.write(token)
 PY
   LISTENER_PID="$!"
 
-  # Wait briefly for the listener to report its bound port.
+  # Wait briefly for the listener to report its bound port + authorize URL.
   for _ in $(seq 1 40); do
-    if [ -s "$PORT_FILE" ]; then
+    if [ -s "$PORT_FILE" ] && [ -s "$AUTHURL_FILE" ]; then
       break
     fi
     sleep 0.1
   done
   LISTEN_PORT="$(cat "$PORT_FILE" 2>/dev/null || true)"
-  if [ -z "${LISTEN_PORT:-}" ]; then
-    warn "Loopback listener did not start."
+  AUTH_URL="$(cat "$AUTHURL_FILE" 2>/dev/null || true)"
+  if [ -z "${LISTEN_PORT:-}" ] || [ -z "${AUTH_URL:-}" ]; then
+    warn "PKCE loopback listener did not start."
     kill "$LISTENER_PID" >/dev/null 2>&1 || true
     return 1
   fi
 
-  CALLBACK="http://127.0.0.1:${LISTEN_PORT}/callback"
-  AUTH_URL="${VIBER_AUTHORIZE_URL}?redirect_uri=$(urlencode "$CALLBACK")"
-
-  log "Opening browser for GitHub sign-in:"
+  log "Opening browser for GitHub sign-in (PKCE loopback on 127.0.0.1:${LISTEN_PORT}):"
   log "  ${AUTH_URL}"
   if ! open_browser "$AUTH_URL"; then
     warn "Could not open a browser automatically. Open this URL manually:"
     printf '%s\n' "$AUTH_URL" >&2
   fi
 
-  # Wait for the background listener to capture the token (or time out).
-  wait "$LISTENER_PID" 2>/dev/null || true
+  # Wait for the background listener to capture the code AND complete the
+  # exchange (or time out / fail). A nonzero exit prints its own SystemExit msg.
+  if ! wait "$LISTENER_PID"; then
+    warn "PKCE handoff did not complete (browser closed, timeout, or exchange error)."
+  fi
 
   if [ -s "$TOKEN_FILE" ]; then
     SUBMIT_TOKEN="$(cat "$TOKEN_FILE")"

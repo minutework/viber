@@ -17,6 +17,13 @@ analyzes your transcripts **locally**, and the **only** thing transmitted is one
 machine**. You can read every line, watch it work, and `--dry-run` to print the exact payload before
 anything is sent.
 
+Sign-in uses a **PKCE GitHub-OAuth loopback handoff** against the MinuteWork platform
+(`VIBER_PLATFORM_BASE_URL`): the bootstrap generates a PKCE verifier locally, opens your browser to
+the platform start URL with only a `127.0.0.1` `redirect_uri` + the S256 `code_challenge`, receives a
+single-use authorization **code** on a local listener, then exchanges that code for a short-lived
+**signed submission token** — which is held in memory and passed to the submit MCP via env only,
+never written to disk.
+
 - **Privacy:** a hard allowlist ([`schema/profile.schema.json`](schema/profile.schema.json)) + two
   fail-closed redaction layers (secrets, then code/paths/identifiers), enforced on both the client
   and the server. See [`docs/data-handling.md`](docs/data-handling.md) for the exact "what leaves"
@@ -43,9 +50,15 @@ anything is sent.
 `schema/`, `skill/rubric.md`, and `docs/data-handling.md` are frozen (S0). `skill/SKILL.md`,
 `mcp/` (the submit MCP + clean-room two-layer redaction lib), and `upload.sh` (the bootstrap)
 are implemented (S3) and ship **Claude + Codex first**; Cursor is best-effort behind a format
-probe (its chat store is binary, not plaintext). The live submit/authorize endpoints are
-provided by the MinuteWork platform + public-dj (S1/S2). See the dispatch packet in the
-MinuteWork monorepo.
+probe (its chat store is binary, not plaintext). `upload.sh` is wired to the **real** S1 PKCE
+endpoints (`/api/v1/developer/builder-profile/oauth/github/start/` →
+`…/submission-token/exchange/`) on the platform (`VIBER_PLATFORM_BASE_URL`, default
+`https://platform.minutework.ai`); the public-dj ingest endpoint (`VIBER_PUBLIC_DJ_BASE_URL`) is
+provided by S2. See the dispatch packet in the MinuteWork monorepo.
+
+Bootstrap env overrides: `VIBER_PLATFORM_BASE_URL` (or the full `VIBER_OAUTH_START_URL` /
+`VIBER_TOKEN_EXCHANGE_URL`), `VIBER_PUBLIC_DJ_BASE_URL`, `VIBER_SKILL_URL`, `VIBER_MCP_PACKAGE`,
+`VIBER_LOOPBACK_PORT`.
 
 ### Build & test the MCP
 
