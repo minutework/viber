@@ -1,0 +1,396 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://viber.minutework.ai/schema/profile.schema.json",
+  "title": "Verifiable AI-Builder Profile",
+  "description": "The ONLY payload submitted to public-dj. HARD ALLOWLIST: additionalProperties is false at every level, every string is length/enum/pattern bounded, opaque ids are hex-only, and no field is named for a path, filename, author email/name, raw code, or secret. STRUCTURAL guarantees are: (i) closed objects (no extra fields), (ii) type/length/enum/pattern bounds, (iii) hex-only opaque ids that cannot encode a path/identifier/email/repo-or-org name. PII exclusion WITHIN allowed free-text fields (e.g. rationale, excerpt, summary) is NOT provided by length bounds; it is enforced by the two redaction layers + public-dj's independent re-scrub-and-REJECT. It is the 1:1 mirror of docs/data-handling.md, enforced fail-closed by BOTH the client Validator and public-dj ingestion. Raw transcripts and source code are NEVER part of this payload.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "rubric_version",
+    "handle",
+    "generated_at",
+    "agent",
+    "analysis_manifest",
+    "dimensions",
+    "archetype",
+    "overall_grade",
+    "overall_score",
+    "overall_summary",
+    "top_strengths",
+    "growth_edges",
+    "episode_scores",
+    "redaction_report"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Version of this schema the payload was built against. Frozen per release.",
+      "const": "1.0.0"
+    },
+    "rubric_version": {
+      "description": "Version of skill/rubric.md used to score. Const-pinned per release (mirrors schema_version); public-dj rejects any other value.",
+      "const": "1.0.0"
+    },
+    "handle": {
+      "description": "Lowercased GitHub username. The ONLY identity field. Comes from the verified submission token's claims, never from transcript text. public-dj overwrites/validates this against the token on ingestion.",
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$",
+      "maxLength": 39
+    },
+    "generated_at": {
+      "description": "UTC ISO-8601 timestamp when the profile was synthesized.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "agent": {
+      "description": "Which coding agent performed the local analysis. No version path or install location.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool"],
+      "properties": {
+        "tool": { "enum": ["claude", "codex", "cursor"] },
+        "tool_version": {
+          "description": "Reported agent CLI version string only (e.g. '1.2.3'). Pattern excludes '/', whitespace, and '@' so no path/host can hide here.",
+          "type": "string",
+          "maxLength": 40,
+          "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]{0,39}$"
+        },
+        "parallelism": {
+          "description": "Whether the run used true subagent parallelism or a sequential-shard fallback.",
+          "enum": ["parallel", "sequential"]
+        }
+      }
+    },
+    "analysis_manifest": {
+      "description": "Aggregate run statistics. Counts and windows only; nothing identifying.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_count", "episode_count", "project_scope"],
+      "properties": {
+        "session_count": { "type": "integer", "minimum": 0 },
+        "episode_count": { "type": "integer", "minimum": 0 },
+        "scored_episode_count": { "type": "integer", "minimum": 0 },
+        "total_tokens_estimate": { "type": "integer", "minimum": 0 },
+        "analyzed_token_estimate": { "type": "integer", "minimum": 0 },
+        "time_window": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "first_activity_at": { "type": "string", "format": "date-time" },
+            "last_activity_at": { "type": "string", "format": "date-time" },
+            "active_days": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "project_scope": {
+          "description": "Confirmation the analysis was scoped to a single chosen project. NEVER a name, path, or remote URL — only the assertion and a count of repos considered (must be 1).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["single_project", "repos_considered"],
+          "properties": {
+            "single_project": { "const": true },
+            "repos_considered": { "const": 1 }
+          }
+        }
+      }
+    },
+    "dimensions": {
+      "description": "The eight competency dimensions. A dimension key is OMITTED entirely when there is no direct evidence (omission != low score). Every present dimension MUST carry >=2 cited, redacted evidence excerpts. These scores are RECOMPUTED server-side by public-dj from the verified per-episode scores (rubric.md §4); client-submitted values are advisory display hints only and are overwritten on ingestion.",
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "architecture": { "$ref": "#/$defs/dimensionScore" },
+        "decomposition": { "$ref": "#/$defs/dimensionScore" },
+        "steering": { "$ref": "#/$defs/dimensionScore" },
+        "debugging": { "$ref": "#/$defs/dimensionScore" },
+        "code_review": { "$ref": "#/$defs/dimensionScore" },
+        "velocity": { "$ref": "#/$defs/dimensionScore" },
+        "product": { "$ref": "#/$defs/dimensionScore" },
+        "communication": { "$ref": "#/$defs/dimensionScore" }
+      }
+    },
+    "archetype": {
+      "description": "Short builder archetype label (e.g. 'Systems Architect', 'Rapid Prototyper'). Generated narrative; re-scrubbed.",
+      "type": "string",
+      "maxLength": 60
+    },
+    "overall_grade": {
+      "enum": ["exceptional", "strong", "proficient", "developing", "emerging"]
+    },
+    "overall_score": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "overall_summary": {
+      "description": "Scrubbed narrative summary. LLM-generated text is re-run through both redaction layers before it lands here.",
+      "type": "string",
+      "maxLength": 2000
+    },
+    "top_strengths": {
+      "type": "array",
+      "maxItems": 5,
+      "items": { "type": "string", "maxLength": 160 }
+    },
+    "growth_edges": {
+      "type": "array",
+      "maxItems": 5,
+      "items": { "type": "string", "maxLength": 160 }
+    },
+    "episode_scores": {
+      "description": "Per-episode scoring records; the unit of analysis is the EPISODE, not the session. An episode can only be listed if the public-dj scoring proxy scored it and returned a nonce (nonce is required), so unscored episodes are simply ABSENT rather than submitted unverified. On ingestion public-dj recomputes each nonce; an episode whose nonce FAILS verification is stored held (verified=false). public-dj also requires the submitted set to cover EVERY request_id the proxy issued for this submission token (blocks dropping low-scoring episodes), and RECOMPUTES all aggregate scores (dimensions.*, overall_*) from the verified per-episode scores per rubric.md §4.",
+      "type": "array",
+      "maxItems": 2000,
+      "items": { "$ref": "#/$defs/episodeScore" }
+    },
+    "session_metadata": {
+      "description": "Per-session aggregate metadata. session_ref is an opaque, locally-salted hash, never the real session id or any path.",
+      "type": "array",
+      "maxItems": 2000,
+      "items": { "$ref": "#/$defs/sessionMetadata" }
+    },
+    "git_metrics": {
+      "description": "Aggregate git statistics derived host-side. NO per-file paths, NO filenames, NO author name, NO author email. File involvement expressed only as counts and extension histograms.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "commit_count": { "type": "integer", "minimum": 0 },
+        "lines_added": { "type": "integer", "minimum": 0 },
+        "lines_deleted": { "type": "integer", "minimum": 0 },
+        "files_changed_count": { "type": "integer", "minimum": 0 },
+        "active_days": { "type": "integer", "minimum": 0 },
+        "commits_per_active_day": { "type": "number", "minimum": 0 },
+        "extension_histogram": {
+          "description": "Map of file EXTENSION (no dot, no path) -> change count. Extensions only; e.g. {\"ts\": 40, \"py\": 12}. Keys validated against a safe pattern.",
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[a-z0-9]{1,12}$": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "velocity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "median_commit_gap_minutes": { "type": "number", "minimum": 0 },
+            "busiest_hour_utc": { "type": "integer", "minimum": 0, "maximum": 23 },
+            "weekend_share": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        }
+      }
+    },
+    "recent_commits": {
+      "description": "Scrubbed commit subjects with timestamps ONLY. No author name, no author email, and NO commit hash (a real short hash is cross-referenceable against the public repo and would deanonymize the user/repo/author given the handle). Subjects pass both redaction layers.",
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["subject", "authored_at"],
+        "properties": {
+          "subject": { "type": "string", "maxLength": 200 },
+          "authored_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "decisions": {
+      "description": "Notable steering/architecture decisions, fully redacted. proposal/response are paraphrased and scrubbed — never raw transcript or code.",
+      "type": "array",
+      "maxItems": 100,
+      "items": { "$ref": "#/$defs/decision" }
+    },
+    "code_quality": {
+      "description": "Aggregate code-quality signals inferred from behavior. Booleans and counts only; never code.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tests_written_signal": { "type": "number", "minimum": 0, "maximum": 1 },
+        "reviews_ai_output_signal": { "type": "number", "minimum": 0, "maximum": 1 },
+        "refactor_signal": { "type": "number", "minimum": 0, "maximum": 1 },
+        "blind_accept_signal": { "type": "number", "minimum": 0, "maximum": 1 },
+        "notes": { "type": "string", "maxLength": 600 }
+      }
+    },
+    "client_telemetry": {
+      "description": "Non-identifying client run telemetry. OS FAMILY only (darwin/linux/win), never hostname/username/path.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "os_family": { "enum": ["darwin", "linux", "windows", "unknown"] },
+        "run_duration_ms": { "type": "integer", "minimum": 0 },
+        "skill_version": { "type": "string", "maxLength": 40, "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]{0,39}$" },
+        "mcp_version": { "type": "string", "maxLength": 40, "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]{0,39}$" }
+      }
+    },
+    "redaction_report": {
+      "description": "Client self-attestation that both redaction layers ran fail-closed. ADVISORY/telemetry only: public-dj independently re-runs BOTH redactors over EVERY text field regardless of these counts and REJECTS the whole submission on any hit. Both layer booleans must be true (a single layer is not acceptable).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["secret_scrubber_applied", "code_path_identifier_redactor_applied", "fail_closed"],
+      "properties": {
+        "secret_scrubber_applied": { "const": true },
+        "code_path_identifier_redactor_applied": { "const": true },
+        "fail_closed": { "const": true },
+        "secrets_scrubbed_count": { "type": "integer", "minimum": 0 },
+        "paths_scrubbed_count": { "type": "integer", "minimum": 0 },
+        "identifiers_scrubbed_count": { "type": "integer", "minimum": 0 },
+        "fields_dropped_count": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "$defs": {
+    "dimensionScore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["score", "confidence", "rationale", "evidence"],
+      "properties": {
+        "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "rationale": {
+          "description": "Scrubbed rationale for the score. Re-run through both redaction layers.",
+          "type": "string",
+          "maxLength": 800
+        },
+        "evidence": {
+          "description": "2-3 cited, redacted excerpts proving the score. No evidence => the dimension must be omitted, not scored.",
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 3,
+          "items": { "$ref": "#/$defs/evidenceExcerpt" }
+        }
+      }
+    },
+    "evidenceExcerpt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["episode_id", "excerpt", "why"],
+      "properties": {
+        "episode_id": { "$ref": "#/$defs/episodeId" },
+        "excerpt": {
+          "description": "A short, paraphrased-and-scrubbed quote illustrating the behavior. NEVER raw code, paths, identifiers, or secrets. Passes both redaction layers.",
+          "type": "string",
+          "maxLength": 400
+        },
+        "why": {
+          "description": "One line: why this excerpt supports the score.",
+          "type": "string",
+          "maxLength": 240
+        }
+      }
+    },
+    "episodeScore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["episode_id", "type", "scores", "confidence", "nonce"],
+      "properties": {
+        "episode_id": { "$ref": "#/$defs/episodeId" },
+        "title": {
+          "description": "Scrubbed episode title/intent.",
+          "type": "string",
+          "maxLength": 200
+        },
+        "type": {
+          "enum": ["feature", "bugfix", "refactor", "investigation", "infra", "review", "planning", "other"]
+        },
+        "scores": {
+          "description": "Per-dimension mini-scores for this episode. Only dimensions with evidence in this episode appear.",
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "architecture": { "$ref": "#/$defs/score0to100" },
+            "decomposition": { "$ref": "#/$defs/score0to100" },
+            "steering": { "$ref": "#/$defs/score0to100" },
+            "debugging": { "$ref": "#/$defs/score0to100" },
+            "code_review": { "$ref": "#/$defs/score0to100" },
+            "velocity": { "$ref": "#/$defs/score0to100" },
+            "product": { "$ref": "#/$defs/score0to100" },
+            "communication": { "$ref": "#/$defs/score0to100" }
+          }
+        },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "session_refs": {
+          "type": "array",
+          "maxItems": 20,
+          "items": { "$ref": "#/$defs/opaqueRef" }
+        },
+        "nonce": { "$ref": "#/$defs/scoringNonce" }
+      }
+    },
+    "scoringNonce": {
+      "description": "Proxy-issued, tamper-evident integrity token; the public-dj scoring proxy returns one per episode it scores. FROZEN CANONICAL PREIMAGE: signature = base64url(HMAC-SHA256(server_key, request_id + '\\n' + handle + '\\n' + digest + '\\n' + canonical_scores)), where digest = base64url(SHA-256(JCS({episode_id, type, scores}))), JCS = RFC 8785 canonical JSON (sorted keys, no whitespace), canonical_scores = JCS of the scores object, and handle is the verified submission-token handle (binds the nonce to the submitter, preventing cross-account replay). On ingestion public-dj RECOMPUTES digest+signature from the SUBMITTED episode + its own server_key + the token handle, treats the proxy-log scores as authoritative (overwriting submitted episode scores), and HOLDS the episode (verified=false) on any of: signature mismatch, digest != submitted episode, handle mismatch, expired/unknown request_id, or request_id not in the proxy log for this token.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "signature", "digest", "issued_at"],
+      "properties": {
+        "request_id": { "type": "string", "pattern": "^[A-Za-z0-9_-]{16,64}$" },
+        "signature": {
+          "description": "Base64url HMAC-SHA256 over the frozen preimage (see scoringNonce.description).",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{32,128}$"
+        },
+        "digest": {
+          "description": "Base64url-unpadded SHA-256 (exactly 43 chars) of JCS({episode_id, type, scores}). public-dj recomputes from the submitted episode and compares.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "issued_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "sessionMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_ref", "message_count"],
+      "properties": {
+        "session_ref": { "$ref": "#/$defs/opaqueRef" },
+        "agent_type": { "enum": ["claude", "codex", "cursor"] },
+        "message_count": { "type": "integer", "minimum": 0 },
+        "first_prompt": {
+          "description": "Scrubbed first user prompt, bounded. Passes both redaction layers.",
+          "type": "string",
+          "maxLength": 200
+        },
+        "started_at": { "type": "string", "format": "date-time" },
+        "ended_at": { "type": "string", "format": "date-time" },
+        "is_subagent": { "type": "boolean" },
+        "session_intent": {
+          "enum": ["feature", "bugfix", "refactor", "investigation", "infra", "review", "planning", "other"]
+        },
+        "active_minutes": { "type": "number", "minimum": 0 }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision_id", "type", "proposal", "response"],
+      "properties": {
+        "decision_id": { "type": "string", "pattern": "^[a-f0-9]{16,64}$" },
+        "type": {
+          "enum": ["architecture", "tradeoff", "course_correction", "scope", "tooling", "other"]
+        },
+        "proposal": {
+          "description": "Paraphrased, scrubbed description of what was proposed. Never raw transcript/code.",
+          "type": "string",
+          "maxLength": 400
+        },
+        "response": {
+          "description": "Paraphrased, scrubbed description of the human's decision/response.",
+          "type": "string",
+          "maxLength": 400
+        },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "significance": { "enum": ["low", "medium", "high"] },
+        "reversibility": { "enum": ["reversible", "costly", "irreversible"] },
+        "outcome": { "enum": ["accepted", "rejected", "modified", "deferred", "unknown"] },
+        "episode_id": { "$ref": "#/$defs/episodeId" }
+      }
+    },
+    "episodeId": {
+      "description": "Stable opaque episode id: a locally-generated hex digest (e.g. truncated salted SHA-256). Hex-only (0-9a-f) so it cannot encode a path, code identifier, email, or repo/org name.",
+      "type": "string",
+      "pattern": "^[a-f0-9]{16,64}$"
+    },
+    "opaqueRef": {
+      "description": "Opaque, locally-salted reference: a hex digest (e.g. truncated HMAC of the real id). Hex-only so it cannot encode a session id, path, filename, identifier, or repo/org name.",
+      "type": "string",
+      "pattern": "^[a-f0-9]{16,64}$"
+    },
+    "score0to100": { "type": "integer", "minimum": 0, "maximum": 100 }
+  }
+}
