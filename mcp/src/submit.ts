@@ -8,8 +8,7 @@
  *      independent re-scrub-and-REJECT). The agent is expected to have already
  *      paraphrased + redacted; this is the deterministic backstop.
  *   3. If --dry-run: print the EXACT payload that would be sent and send nothing.
- *   4. Otherwise POST the profile to the public-dj ingest endpoint with the
- *      signed submission token in the Authorization header.
+ *   4. Otherwise POST { token, profile } to the public-dj ingest endpoint.
  *
  * The token is the bearer of the verified GitHub handle; the body's `handle`
  * field is overwritten/validated against the token by public-dj on ingestion.
@@ -172,11 +171,8 @@ export async function submitProfile(options: SubmitOptions): Promise<SubmitOutco
   try {
     response = await fetchImpl(options.ingestUrl, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${options.token}`,
-      },
-      body: JSON.stringify(options.profile),
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: options.token, profile: options.profile }),
     });
   } catch (cause) {
     return {

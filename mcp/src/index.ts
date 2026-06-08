@@ -23,6 +23,11 @@ export {
   type ViberMcpCliOptions,
 } from "./server.js";
 export {
+  scoreEpisodes,
+  type ScoreEpisodesOptions,
+  type ScoreEpisodesOutcome,
+} from "./score.js";
+export {
   scanProfileForLeaks,
   submitProfile,
   type RedactionScan,

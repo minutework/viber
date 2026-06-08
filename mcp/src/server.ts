@@ -6,6 +6,7 @@ import { z } from "zod";
 
 import { resolveConfig, type ViberMcpConfig } from "./config.js";
 import { buildAnalysisManifest } from "./manifest.js";
+import { scoreEpisodes } from "./score.js";
 import { submitProfile } from "./submit.js";
 
 export interface ViberMcpCliOptions {
@@ -40,6 +41,9 @@ export function renderViberMcpHelp(): string {
     "  analysis_manifest()       Return schema_version, rubric_version, and the",
     "                            data-handling 'what leaves / what never leaves'",
     "                            summary so the agent sees exactly what is allowed.",
+    "  score_episodes(episodes)  POST redacted episode summaries to the public-dj",
+    "                            scoring proxy using the in-memory submission token",
+    "                            and return nonce-bearing scored episodes.",
     "",
     "Flags:",
     "  --dry-run                 Print the exact payload that would be sent and",
@@ -50,6 +54,7 @@ export function renderViberMcpHelp(): string {
     "  VIBER_SUBMIT_TOKEN        Signed submission token (set by the bootstrap).",
     "  VIBER_PUBLIC_DJ_BASE_URL  public-dj base URL (default https://viber.minutework.ai).",
     "  VIBER_INGEST_URL          Override the full ingest URL.",
+    "  VIBER_SCORE_URL           Override the full score proxy URL.",
     "  VIBER_DRY_RUN             '1'/'true' to force dry-run.",
   ].join("\n");
 }
@@ -70,6 +75,36 @@ export function createViberMcpServer(config: ViberMcpConfig) {
       inputSchema: {},
     },
     async () => createStructuredToolResult(buildAnalysisManifest()),
+  );
+
+  server.registerTool(
+    "score_episodes",
+    {
+      description:
+        "Send redacted episode summaries to the public-dj scoring proxy using the submission token held in " +
+        "this MCP process, then return authoritative scores and integrity nonces. " +
+        "Input episodes should be compact objects such as { episode_id, type, summary }. " +
+        "SECURITY: do not include raw transcripts, code, paths, emails, secrets, or identifiers in summaries.",
+      inputSchema: {
+        episodes: z
+          .array(z.record(z.string(), z.unknown()))
+          .min(1)
+          .describe("Redacted episode digest objects to score; no raw transcripts or source code."),
+      },
+    },
+    async (input: { episodes: unknown }) => {
+      const outcome = await scoreEpisodes({
+        episodes: input.episodes,
+        token: config.token,
+        scoreUrl: config.scoreUrl,
+      });
+      return createStructuredToolResult({
+        ok: outcome.ok,
+        status: outcome.status ?? null,
+        errors: outcome.errors,
+        response: outcome.responseBody ?? null,
+      });
+    },
   );
 
   server.registerTool(

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { validateProfileAgainstSchema } from "../src/schema.ts";
+import { scoreEpisodes } from "../src/score.ts";
 import { scanProfileForLeaks, submitProfile } from "../src/submit.ts";
 import { makeValidProfile } from "./fixtures.ts";
 
@@ -68,7 +69,7 @@ test("a planted path in an excerpt aborts submission", async () => {
   assert.equal(scan.clean, false);
 });
 
-test("live submit POSTs with a bearer token and reports the status", async () => {
+test("live submit POSTs token and profile in the ingest body", async () => {
   const profile = makeValidProfile();
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const fetchImpl = (async (url: string, init: RequestInit) => {
@@ -89,5 +90,53 @@ test("live submit POSTs with a bearer token and reports the status", async () =>
   assert.equal(calls.length, 1);
   assert.equal(calls[0].init.method, "POST");
   const headers = calls[0].init.headers as Record<string, string>;
-  assert.equal(headers.authorization, "Bearer signed-token-xyz");
+  assert.equal(headers["content-type"], "application/json");
+  assert.deepEqual(JSON.parse(calls[0].init.body as string), {
+    token: "signed-token-xyz",
+    profile,
+  });
+});
+
+test("score_episodes POSTs token inside JSON body and returns scored nonce payload", async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fetchImpl = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return new Response(
+      JSON.stringify({
+        handle: "octocat",
+        episodes: [
+          {
+            episode_id: "abc123",
+            type: "feature",
+            scores: { steering: 80 },
+            confidence: 0.7,
+            nonce: {
+              request_id: "req_abcDEF0123456789",
+              signature: "sig",
+              digest: "dig",
+              issued_at: "2026-06-07T11:59:00Z",
+            },
+          },
+        ],
+      }),
+      { status: 200 },
+    );
+  }) as unknown as typeof fetch;
+
+  const outcome = await scoreEpisodes({
+    token: "signed-token-xyz",
+    scoreUrl: "https://viber.minutework.ai/api/v1/builder-profiles/score/",
+    episodes: [{ episode_id: "abc123", type: "feature", summary: "Redacted steering episode." }],
+    fetchImpl,
+  });
+
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://viber.minutework.ai/api/v1/builder-profiles/score/");
+  assert.equal(calls[0].init.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0].init.body as string), {
+    token: "signed-token-xyz",
+    episodes: [{ episode_id: "abc123", type: "feature", summary: "Redacted steering episode." }],
+  });
 });
