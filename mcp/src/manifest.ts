@@ -40,8 +40,12 @@ export function buildAnalysisManifest(): AnalysisManifest {
       "Recent commit subjects (<=200 chars, double-redacted, + timestamp — no author name/email, no hash)",
       "Decisions (paraphrased proposal/response + tags)",
       "Code-quality signals (floats 0-1, counts — behavioral inference, never code)",
-      "Client telemetry (OS family darwin/linux/windows only, durations, pattern-bounded versions)",
+      "Client telemetry (OS family darwin/linux/windows only, durations, pattern-bounded versions incl. classifier version)",
       "Redaction report (two applied:true flags + counts — advisory; public-dj re-verifies independently)",
+      "Model usage split (allowlisted model-family names + session counts/shares — unknown ids fail closed and are dropped)",
+      "Behavioral aggregates (schema 1.1.0, all numeric/enum): plan-mode shares, interruption counts/rates, concurrency maxima, prompt statistics (word-count histograms, politeness/question/crash-out COUNTS — never prompt text), local-clock hour/weekday histograms (no timezone name), longest-run duration, rolling 30-day windows",
+      "Work streams (salted opaque stream refs + session/commit counts and durations — no branch names or titles)",
+      "Craft/economics/orchestration/identity stat blocks (rates, medians, counts: edit precision, red-to-green minutes, blast radius, churn, cache hit rate, delegation depth, streaks, tool loyalty — all derived numbers, no underlying text)",
     ],
     what_never_leaves: [
       "Raw transcripts (Claude/Codex/Cursor)",

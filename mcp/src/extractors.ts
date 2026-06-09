@@ -12,6 +12,7 @@ import {
   collectCursorBubbleSignals,
   collectCursorComposerSignals,
   emptySessionSignals,
+  finalizeSessionSignals,
   type SessionSignals,
 } from "./signals.js";
 
@@ -226,7 +227,7 @@ export interface ActualMetricsBundle {
   warnings: string[];
 }
 
-interface NormalizedEvent {
+export interface NormalizedEvent {
   tool: AgentTool;
   role: EventRole;
   text: string;
@@ -244,7 +245,7 @@ interface NormalizedEvent {
   codeOutputChars: number;
 }
 
-interface NormalizedSession {
+export interface NormalizedSession {
   tool: AgentTool;
   sessionKey: string;
   sessionRef: string;
@@ -293,7 +294,7 @@ interface ActualCollectorResult {
   tokenSource: TokenSourceStatus;
 }
 
-interface TokenUsage {
+export interface TokenUsage {
   input: number;
   cachedInput: number;
   cacheCreationInput: number;
@@ -498,6 +499,180 @@ export function buildEpisodeCandidates(options: LocalExtractorOptions = {}): Epi
     },
     warnings: coverage.warnings,
   };
+}
+
+/**
+ * Normalized session access for the aggregates module (Wave 2). Same
+ * collectors and scope rules as buildEpisodeCandidates; LOCAL-only data.
+ */
+export interface CollectedNormalizedSessions {
+  sessions: NormalizedSession[];
+  warnings: string[];
+}
+
+export function collectNormalizedSessions(options: LocalExtractorOptions = {}): CollectedNormalizedSessions {
+  const context = createExtractorContext(options);
+  const collected = collectAllSessions(context);
+  return {
+    sessions: collected.flatMap((entry) => entry.sessions),
+    warnings: collected.flatMap((entry) => entry.warnings),
+  };
+}
+
+/** Uncapped per-session timing/token data (metrics path) for the aggregates module. */
+export interface ActualSessionData {
+  tool: AgentTool;
+  timestampMs: number[];
+  tokenUsage?: TokenUsage;
+  tokenEvents?: Array<{ timestampMs: number; total: number }>;
+  isSubagent: boolean;
+}
+
+export function collectActualSessionData(options: LocalExtractorOptions = {}): {
+  sessions: ActualSessionData[];
+  warnings: string[];
+} {
+  const context = createExtractorContext(options);
+  const collectors = [
+    collectActualClaudeMetrics(context),
+    collectActualCodexMetrics(context),
+    collectActualCursorMetrics(context),
+  ];
+  const sessions: ActualSessionData[] = [];
+  const toEvents = (session: ActualSessionMetric) =>
+    (session.tokenEvents ?? []).map((event) => ({ timestampMs: event.timestampMs, total: event.usage.total }));
+  for (const collector of collectors) {
+    for (const session of collector.sessions) {
+      sessions.push({
+        tool: collector.tool,
+        timestampMs: session.timestampMs,
+        ...(session.tokenUsage ? { tokenUsage: session.tokenUsage } : {}),
+        tokenEvents: toEvents(session),
+        isSubagent: false,
+      });
+    }
+    for (const session of collector.subagentSessions ?? []) {
+      sessions.push({
+        tool: collector.tool,
+        timestampMs: session.timestampMs,
+        ...(session.tokenUsage ? { tokenUsage: session.tokenUsage } : {}),
+        tokenEvents: toEvents(session),
+        isSubagent: true,
+      });
+    }
+  }
+  return { sessions, warnings: collectors.flatMap((collector) => collector.warnings) };
+}
+
+/**
+ * Author-filtered commit stats for the aggregates module. Subjects are NEVER
+ * returned — fix-likeness is computed in place so no commit text leaves this
+ * function.
+ */
+export interface GitCommitStat {
+  authoredAt: string;
+  added: number;
+  deleted: number;
+  files: number;
+  isFixLike: boolean;
+}
+
+export function collectGitCommitStats(options: LocalExtractorOptions = {}): {
+  commits: GitCommitStat[];
+  mergeCommitCount30d: number;
+  addedFileCount: number;
+  modifiedFileCount: number;
+  warnings: string[];
+} {
+  const context = createExtractorContext(options);
+  const gitPath = options.gitPath ?? "git";
+  const repoPath = context.selectedProjectPath;
+  const warnings: string[] = [];
+  const empty = { commits: [], mergeCommitCount30d: 0, addedFileCount: 0, modifiedFileCount: 0, warnings };
+  const gitCheck = spawnSync(gitPath, ["-C", repoPath, "rev-parse", "--show-toplevel"], {
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+  });
+  if (gitCheck.status !== 0) {
+    warnings.push("selected_project_not_git_repo");
+    return empty;
+  }
+  const authorEmails = detectAuthorEmails(gitPath, repoPath);
+  if (authorEmails.length === 0) {
+    warnings.push("git_author_filter_unavailable");
+  }
+  const authorArgs = authorEmails.map((email) => `--author=${escapeRegExp(email)}`);
+  const commits: GitCommitStat[] = [];
+  try {
+    const output = execFileSync(
+      gitPath,
+      ["-C", repoPath, "log", ...authorArgs, "--numstat", "--format=__VIBER_COMMIT__%x09%cI%x09%s", "--no-renames"],
+      { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 },
+    );
+    let current: GitCommitStat | null = null;
+    for (const line of output.split(/\r?\n/)) {
+      if (!line) {
+        continue;
+      }
+      if (line.startsWith("__VIBER_COMMIT__\t")) {
+        if (current) {
+          commits.push(current);
+        }
+        const [, authoredAt = "", subject = ""] = line.split("\t");
+        current = {
+          authoredAt,
+          added: 0,
+          deleted: 0,
+          files: 0,
+          isFixLike: /\b(fix|hotfix|bugfix|revert|patch|regression)\b/i.test(subject),
+        };
+        continue;
+      }
+      if (!current) {
+        continue;
+      }
+      const [addedRaw, deletedRaw] = line.split("\t");
+      current.added += parseNumstatValue(addedRaw);
+      current.deleted += parseNumstatValue(deletedRaw);
+      current.files += 1;
+    }
+    if (current) {
+      commits.push(current);
+    }
+  } catch {
+    warnings.push("git_log_failed");
+    return empty;
+  }
+  let mergeCommitCount30d = 0;
+  try {
+    const output = execFileSync(
+      gitPath,
+      ["-C", repoPath, "rev-list", "--merges", "--count", "--since=30 days ago", "HEAD"],
+      { encoding: "utf8", maxBuffer: 1024 * 1024 },
+    );
+    mergeCommitCount30d = Number.parseInt(output.trim(), 10) || 0;
+  } catch {
+    warnings.push("git_merge_count_failed");
+  }
+  let addedFileCount = 0;
+  let modifiedFileCount = 0;
+  try {
+    const output = execFileSync(
+      gitPath,
+      ["-C", repoPath, "log", ...authorArgs, "--name-status", "--format=", "--no-renames", "--max-count=2000"],
+      { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 },
+    );
+    for (const line of output.split(/\r?\n/)) {
+      if (line.startsWith("A\t")) {
+        addedFileCount += 1;
+      } else if (line.startsWith("M\t")) {
+        modifiedFileCount += 1;
+      }
+    }
+  } catch {
+    warnings.push("git_name_status_failed");
+  }
+  return { commits, mergeCommitCount30d, addedFileCount, modifiedFileCount, warnings };
 }
 
 export function gitAggregateMetrics(options: LocalExtractorOptions = {}): GitAggregateMetrics {
@@ -1687,6 +1862,7 @@ function parseJsonlSession(context: ExtractorContext, tool: AgentTool, filePath:
       }
     }
   }
+  finalizeSessionSignals(signals);
   return {
     tool,
     sessionKey,
@@ -2405,7 +2581,7 @@ function normalizeTimestamp(value: unknown): string | undefined {
   return undefined;
 }
 
-function parseTimestampMs(value: string | undefined): number | null {
+export function parseTimestampMs(value: string | undefined): number | null {
   if (!value) {
     return null;
   }
@@ -2442,7 +2618,7 @@ function activeMinutes(timestamps: number[]): number {
   return Math.round(minutes * 10) / 10;
 }
 
-function activeIntervals(timestamps: number[]): Array<{ startMs: number; endMs: number }> {
+export function activeIntervals(timestamps: number[]): Array<{ startMs: number; endMs: number }> {
   const sorted = Array.from(new Set(timestamps.filter((value) => Number.isFinite(value)))).sort((left, right) => left - right);
   if (sorted.length === 0) {
     return [];
@@ -2459,7 +2635,7 @@ function activeIntervals(timestamps: number[]): Array<{ startMs: number; endMs: 
   return intervals;
 }
 
-function mergeIntervals(intervals: Array<{ startMs: number; endMs: number }>): Array<{ startMs: number; endMs: number }> {
+export function mergeIntervals(intervals: Array<{ startMs: number; endMs: number }>): Array<{ startMs: number; endMs: number }> {
   const sorted = [...intervals].sort((left, right) => left.startMs - right.startMs);
   const merged: Array<{ startMs: number; endMs: number }> = [];
   for (const interval of sorted) {
@@ -2654,7 +2830,7 @@ function escapeRegExp(value: string): string {
  * so commit times can be binned in the author's local clock without ever
  * serializing the offset or a timezone name.
  */
-function parseIsoOffsetMinutes(value: string): number | null {
+export function parseIsoOffsetMinutes(value: string): number | null {
   const match = /(Z|[+-]\d{2}:?\d{2})\s*$/.exec(value.trim());
   if (!match) {
     return null;
@@ -2672,7 +2848,7 @@ function parseIsoOffsetMinutes(value: string): number | null {
   return sign * (hours * 60 + minutes);
 }
 
-function localDayOfWeek(isoTimestamp: string): number | null {
+export function localDayOfWeek(isoTimestamp: string): number | null {
   const ms = parseTimestampMs(isoTimestamp);
   if (ms === null) {
     return null;

@@ -26,7 +26,9 @@ const addFormats: AjvFormatsFn = (
   (addFormatsImport as unknown as AjvFormatsFn)
 );
 
-export const SCHEMA_VERSION = "1.0.0";
+export const SCHEMA_VERSION = "1.1.0";
+// Rubric stays 1.0.0 until the Wave 4 rubric ships; the 1.1.0 schema accepts
+// both rubric versions (pairing is enforced by public-dj's compatibility map).
 export const RUBRIC_VERSION = "1.0.0";
 
 const here = dirname(fileURLToPath(import.meta.url));

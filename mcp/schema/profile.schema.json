@@ -25,11 +25,11 @@
   "properties": {
     "schema_version": {
       "description": "Version of this schema the payload was built against. Frozen per release.",
-      "const": "1.0.0"
+      "const": "1.1.0"
     },
     "rubric_version": {
-      "description": "Version of skill/rubric.md used to score. Const-pinned per release (mirrors schema_version); public-dj rejects any other value.",
-      "const": "1.0.0"
+      "description": "Version of skill/rubric.md used to score. Decoupled from the schema pin as of 1.1.0: the allowed pairings (1.1.0 schema accepts rubric 1.0.0 or 1.1.0) are enforced by a server-side compatibility map in public-dj schema_validation, not by this const.",
+      "enum": ["1.0.0", "1.1.0"]
     },
     "handle": {
       "description": "Lowercased GitHub username. The ONLY identity field. Comes from the verified submission token's claims, never from transcript text. public-dj overwrites/validates this against the token on ingestion.",
@@ -183,6 +183,43 @@
             "busiest_hour_utc": { "type": "integer", "minimum": 0, "maximum": 23 },
             "weekend_share": { "type": "number", "minimum": 0, "maximum": 1 }
           }
+        },
+        "commit_hour_histogram_local": { "$ref": "#/$defs/hourHistogram24" },
+        "commits_by_weekday_local": { "$ref": "#/$defs/weekdayHistogram7" },
+        "loc_added_by_weekday_local": { "$ref": "#/$defs/weekdayHistogram7" },
+        "night_owl_share": {
+          "description": "Share of author-filtered commits landing 22:00-02:00 in the author's LOCAL clock (derived from %cI offsets; no timezone name is ever shipped).",
+          "$ref": "#/$defs/share01"
+        },
+        "biggest_push": {
+          "description": "The single biggest calendar day by lines added. WEEKDAY ONLY — the exact date would be cross-referenceable against public repo activity given the handle.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["weekday_local", "commit_count", "lines_added"],
+          "properties": {
+            "weekday_local": { "type": "integer", "minimum": 0, "maximum": 6 },
+            "commit_count": { "type": "integer", "minimum": 0 },
+            "lines_added": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "pr_metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["merged_pr_count_30d", "source"],
+          "properties": {
+            "merged_pr_count_30d": { "type": "integer", "minimum": 0 },
+            "source": { "enum": ["merge_commit_heuristic", "gh_cli"] }
+          }
+        },
+        "last_30_days": {
+          "description": "Rolling trailing-30-day window (author-filtered), unlike the calendar buckets in vibe_loc_by_period.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "commit_count": { "type": "integer", "minimum": 0 },
+            "lines_added": { "type": "integer", "minimum": 0 },
+            "lines_deleted": { "type": "integer", "minimum": 0 }
+          }
         }
       }
     },
@@ -279,6 +316,121 @@
           "type": "array",
           "maxItems": 20,
           "items": { "type": "string", "maxLength": 120, "pattern": "^[a-z0-9_.:-]{1,120}$" }
+        },
+        "model_usage": {
+          "description": "Per model-family usage split. Families come from a fixed client-side allowlist map (fail-closed); raw ids that do not normalize are dropped, so free text can never ride along.",
+          "type": "array",
+          "maxItems": 24,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model_family", "tool", "session_count"],
+            "properties": {
+              "model_family": { "type": "string", "maxLength": 40, "pattern": "^[0-9A-Za-z][0-9A-Za-z .()+-]{0,39}$" },
+              "tool": { "enum": ["claude", "codex", "cursor"] },
+              "session_count": { "type": "integer", "minimum": 0 },
+              "session_share_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+              "token_share_pct": { "type": "number", "minimum": 0, "maximum": 100 }
+            }
+          }
+        },
+        "plan_mode": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "plan_prompts_share": { "$ref": "#/$defs/share01" },
+            "sessions_entering_plan_share": { "$ref": "#/$defs/share01" },
+            "plan_before_first_edit_share": { "$ref": "#/$defs/share01" },
+            "plan_approved_count": { "type": "integer", "minimum": 0 },
+            "plan_edited_before_approval_count": { "type": "integer", "minimum": 0 },
+            "per_tool": { "$ref": "#/$defs/perToolShare" }
+          }
+        },
+        "interruption": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "interrupt_count": { "type": "integer", "minimum": 0 },
+            "interrupts_per_100_prompts": { "type": "number", "minimum": 0 },
+            "redirected_share": { "$ref": "#/$defs/share01" },
+            "abandoned_share": { "$ref": "#/$defs/share01" },
+            "median_rebrief_seconds": { "type": "number", "minimum": 0 },
+            "per_tool": { "$ref": "#/$defs/perToolCount" }
+          }
+        },
+        "concurrency": {
+          "description": "Sweep-line maxima over active intervals. peak_at is hour-truncated. Repo identities never appear — only counts.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_parallel_agents": { "type": "integer", "minimum": 0 },
+            "max_parallel_sessions": { "type": "integer", "minimum": 0 },
+            "max_parallel_subagents_single_session": { "type": "integer", "minimum": 0 },
+            "peak_at": { "type": "string", "format": "date-time" },
+            "by_tool": { "$ref": "#/$defs/perToolCount" }
+          }
+        },
+        "prompt_stats": {
+          "description": "Numeric-only prompt analytics over HUMAN prompts (tool results, sidechains, SDK prompts, command wrappers, and queued duplicates excluded). No prompt text ships in this block.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "prompt_count": { "type": "integer", "minimum": 0 },
+            "median_words": { "type": "number", "minimum": 0 },
+            "under_10_words_share": { "$ref": "#/$defs/share01" },
+            "words_histogram": {
+              "description": "Fixed buckets: <5, 5-9, 10-24, 25-49, 50-99, >=100 words.",
+              "type": "array",
+              "minItems": 6,
+              "maxItems": 6,
+              "items": { "type": "integer", "minimum": 0 }
+            },
+            "politeness": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "thanks_message_count": { "type": "integer", "minimum": 0 },
+                "please_message_count": { "type": "integer", "minimum": 0 },
+                "last_30_days_thanks_message_count": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "crashout_message_count": { "type": "integer", "minimum": 0 },
+            "question_share": { "$ref": "#/$defs/share01" },
+            "opener_split": {
+              "description": "How sessions open, as shares of first human prompts.",
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "command": { "$ref": "#/$defs/share01" },
+                "question": { "$ref": "#/$defs/share01" },
+                "greeting": { "$ref": "#/$defs/share01" },
+                "other": { "$ref": "#/$defs/share01" }
+              }
+            }
+          }
+        },
+        "event_hour_histogram_local": { "$ref": "#/$defs/hourHistogram24" },
+        "longest_agent_run": {
+          "description": "Longest autonomous run between human inputs. The label is the episode-type enum only — no free text.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minutes", "agent_type"],
+          "properties": {
+            "minutes": { "type": "number", "minimum": 0 },
+            "agent_type": { "enum": ["claude", "codex", "cursor"] },
+            "intent": { "enum": ["feature", "bugfix", "refactor", "investigation", "infra", "review", "planning", "other"] },
+            "session_ref": { "$ref": "#/$defs/opaqueRef" }
+          }
+        },
+        "last_30_days": {
+          "description": "Rolling trailing-30-day window, unlike the calendar period buckets.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "vibe_agent_hours": { "type": "number", "minimum": 0 },
+            "active_calendar_hours": { "type": "number", "minimum": 0 },
+            "provider_tokens": { "type": "integer", "minimum": 0 }
+          }
         }
       }
     },
@@ -314,6 +466,176 @@
         "notes": { "type": "string", "maxLength": 600 }
       }
     },
+    "work_streams": {
+      "description": "Multi-session work streams grouped by salted branch ref + overlapping time windows, with commits attached by time+branch match. Counts and durations only; no titles, branch names, or paths.",
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stream_ref", "session_count"],
+        "properties": {
+          "stream_ref": { "$ref": "#/$defs/opaqueRef" },
+          "session_count": { "type": "integer", "minimum": 1 },
+          "active_days": { "type": "integer", "minimum": 0 },
+          "total_active_minutes": { "type": "number", "minimum": 0 },
+          "commit_count": { "type": "integer", "minimum": 0 },
+          "lines_added": { "type": "integer", "minimum": 0 },
+          "started_at": { "type": "string", "format": "date-time" },
+          "ended_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "craft_stats": {
+      "description": "Deterministic engineering-craft aggregates. All shares are 0-1; the command classifier behind the *_rate fields is versioned in client_telemetry.classifier_version.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "edit_precision_rate": { "$ref": "#/$defs/share01" },
+        "edit_attempt_count": { "type": "integer", "minimum": 0 },
+        "red_to_green_median_minutes": { "type": "number", "minimum": 0 },
+        "red_to_green_sample_count": { "type": "integer", "minimum": 0 },
+        "tool_error_recovery_rate": { "$ref": "#/$defs/share01" },
+        "test_before_ship_rate": { "$ref": "#/$defs/share01" },
+        "plan_to_ship_conversion": { "$ref": "#/$defs/share01" },
+        "median_blast_radius_files": { "type": "number", "minimum": 0 },
+        "p90_blast_radius_files": { "type": "number", "minimum": 0 },
+        "refactor_to_greenfield_ratio": { "$ref": "#/$defs/share01" },
+        "rework_rate_48h": { "$ref": "#/$defs/share01" },
+        "pr_routed_share": { "$ref": "#/$defs/share01" },
+        "context_craft_edit_count": {
+          "description": "Edits to agent-context files (CLAUDE.md, AGENTS.md, SKILL.md, rules dirs) matched against a fixed basename allowlist; paths never ship.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "economics_stats": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cache_hit_rate": { "$ref": "#/$defs/share01" },
+        "loc_per_million_tokens": { "type": "number", "minimum": 0 },
+        "churn_ratio": { "type": "number", "minimum": 0 },
+        "idea_to_commit_median_minutes": { "type": "number", "minimum": 0 },
+        "idea_to_commit_sample_count": { "type": "integer", "minimum": 0 },
+        "peak_ship_week": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "lines_added": { "type": "integer", "minimum": 0 },
+            "commit_count": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "orchestration_stats": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sidechain_output_share": { "$ref": "#/$defs/share01" },
+        "deepest_delegation_chain": { "type": "integer", "minimum": 0, "maximum": 16 },
+        "subagent_count": { "type": "integer", "minimum": 0 },
+        "subagent_session_count": { "type": "integer", "minimum": 0 },
+        "cross_tool_spawn_share": {
+          "description": "Share of Codex sessions whose originator is another agent tool rather than the human's CLI.",
+          "$ref": "#/$defs/share01"
+        },
+        "autonomy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "codex_never_approval_share": { "$ref": "#/$defs/share01" },
+            "claude_auto_share": { "$ref": "#/$defs/share01" },
+            "claude_accept_edits_share": { "$ref": "#/$defs/share01" }
+          }
+        },
+        "checklist": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "todo_item_count": { "type": "integer", "minimum": 0 },
+            "update_plan_count": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "ask_user_question": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "question_count": { "type": "integer", "minimum": 0 },
+            "answered_share": { "$ref": "#/$defs/share01" },
+            "median_reply_seconds": { "type": "number", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "identity_stats": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "longest_build_streak_days": { "type": "integer", "minimum": 0 },
+        "current_streak_days": { "type": "integer", "minimum": 0 },
+        "first_contact": {
+          "description": "Earliest corroborated agent activity. Requires >=2 sources active within 30 days of the claimed origin (anti-backdating).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["first_activity_at", "corroborating_sources"],
+          "properties": {
+            "first_activity_at": { "type": "string", "format": "date-time" },
+            "corroborating_sources": { "type": "integer", "minimum": 1, "maximum": 4 }
+          }
+        },
+        "tool_loyalty": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "primary_tool": { "enum": ["claude", "codex", "cursor"] },
+            "primary_tool_active_day_share": { "$ref": "#/$defs/share01" },
+            "all_three_tools_day_count": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "session_shape": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "label": { "enum": ["sprinter", "marathoner", "mixed"] },
+            "median_session_minutes": { "type": "number", "minimum": 0 },
+            "over_two_hours_share": { "$ref": "#/$defs/share01" }
+          }
+        }
+      }
+    },
+    "operating_level": {
+      "description": "Evidence-anchored operating band (rubric 1.1). NEVER a job title. Stored on ingest but served by public-dj only for maturity-established profiles with sufficient episode counts.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["band", "confidence", "evidence"],
+      "properties": {
+        "band": { "enum": ["feature_executor", "system_designer", "platform_shaper"] },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evidence": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 3,
+          "items": { "$ref": "#/$defs/evidenceExcerpt" }
+        }
+      }
+    },
+    "specialty_signals": {
+      "description": "Topic-tagged sub-scores: architecture-dimension evidence filtered to a fixed topic taxonomy. Omit a topic with no evidence.",
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "scalability": { "$ref": "#/$defs/specialtyScore" },
+        "security": { "$ref": "#/$defs/specialtyScore" },
+        "data_modeling": { "$ref": "#/$defs/specialtyScore" },
+        "distributed_systems": { "$ref": "#/$defs/specialtyScore" },
+        "performance": { "$ref": "#/$defs/specialtyScore" },
+        "ux": { "$ref": "#/$defs/specialtyScore" },
+        "tooling": { "$ref": "#/$defs/specialtyScore" }
+      }
+    },
     "client_telemetry": {
       "description": "Non-identifying client run telemetry. OS FAMILY only (darwin/linux/win), never hostname/username/path.",
       "type": "object",
@@ -322,7 +644,8 @@
         "os_family": { "enum": ["darwin", "linux", "windows", "unknown"] },
         "run_duration_ms": { "type": "integer", "minimum": 0 },
         "skill_version": { "type": "string", "maxLength": 40, "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]{0,39}$" },
-        "mcp_version": { "type": "string", "maxLength": 40, "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]{0,39}$" }
+        "mcp_version": { "type": "string", "maxLength": 40, "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]{0,39}$" },
+        "classifier_version": { "type": "string", "maxLength": 40, "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]{0,39}$" }
       }
     },
     "redaction_report": {
@@ -520,7 +843,34 @@
         "significance": { "enum": ["low", "medium", "high"] },
         "reversibility": { "enum": ["reversible", "costly", "irreversible"] },
         "outcome": { "enum": ["accepted", "rejected", "modified", "deferred", "unknown"] },
-        "episode_id": { "$ref": "#/$defs/episodeId" }
+        "episode_id": { "$ref": "#/$defs/episodeId" },
+        "initiative": {
+          "description": "Who raised the concern/direction first (rubric 1.1 initiative attribution).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["raised_by"],
+          "properties": {
+            "raised_by": { "enum": ["human", "agent", "unknown"] }
+          }
+        },
+        "outcome_evidence": {
+          "description": "Deterministic outcome linkage (rubric 1.1): what actually happened after the decision.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "commit_within_2h": { "type": "boolean" },
+            "test_signal_after": { "enum": ["pass", "fail", "none"] },
+            "reversed_later": { "type": "boolean" }
+          }
+        },
+        "topics": {
+          "description": "Fixed topic taxonomy tags feeding specialty_signals.",
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "enum": ["scalability", "security", "data_modeling", "distributed_systems", "performance", "ux", "tooling"]
+          }
+        }
       }
     },
     "episodeId": {
@@ -533,6 +883,49 @@
       "type": "string",
       "pattern": "^[a-f0-9]{16,64}$"
     },
-    "score0to100": { "type": "integer", "minimum": 0, "maximum": 100 }
+    "score0to100": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "share01": { "type": "number", "minimum": 0, "maximum": 1 },
+    "hourHistogram24": {
+      "description": "24 LOCAL-clock hour bins (00..23). Derived from per-record offsets; no timezone identifier ever ships.",
+      "type": "array",
+      "minItems": 24,
+      "maxItems": 24,
+      "items": { "type": "integer", "minimum": 0 }
+    },
+    "weekdayHistogram7": {
+      "description": "7 LOCAL-clock weekday bins (Sunday=0 .. Saturday=6).",
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": { "type": "integer", "minimum": 0 }
+    },
+    "perToolShare": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "claude": { "$ref": "#/$defs/share01" },
+        "codex": { "$ref": "#/$defs/share01" },
+        "cursor": { "$ref": "#/$defs/share01" }
+      }
+    },
+    "perToolCount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "claude": { "type": "integer", "minimum": 0 },
+        "codex": { "type": "integer", "minimum": 0 },
+        "cursor": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "specialtyScore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["score", "confidence", "episode_count"],
+      "properties": {
+        "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "episode_count": { "type": "integer", "minimum": 1 }
+      }
+    }
   }
 }

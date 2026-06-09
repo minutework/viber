@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { resolveConfig, type ViberMcpConfig } from "./config.js";
+import { buildWrappedAggregates } from "./aggregates.js";
 import { buildActualMetrics, buildEpisodeCandidates, discoverLocalSources, gitAggregateMetrics } from "./extractors.js";
 import { buildAnalysisManifest } from "./manifest.js";
 import { scoreEpisodes } from "./score.js";
@@ -112,6 +113,34 @@ export function createViberMcpServer(config: ViberMcpConfig) {
       inputSchema: {},
     },
     async () => createStructuredToolResult(buildActualMetrics({ projectPath: config.selectedProjectPath })),
+  );
+
+  server.registerTool(
+    "build_wrapped_aggregates",
+    {
+      description:
+        "Local-only deterministic wrapped-profile aggregates for the selected project: model usage split, plan-mode/" +
+        "interruption/concurrency/prompt statistics, local-clock hour and weekday histograms, work streams, and the " +
+        "craft/economics/orchestration/identity stat blocks (schema 1.1.0 optional fields). Returns only counts, " +
+        "ratios, enums, durations, and salted opaque refs — no transcript text, paths, branch names, hashes, emails, " +
+        "or timezone identifiers. Sends nothing over the network.",
+      inputSchema: {
+        max_sessions: z
+          .number()
+          .int()
+          .positive()
+          .max(5000)
+          .optional()
+          .describe("Optional local scan cap for the session-derived blocks. Defaults to 1000 sessions."),
+      },
+    },
+    async (input: { max_sessions?: number }) =>
+      createStructuredToolResult(
+        buildWrappedAggregates({
+          projectPath: config.selectedProjectPath,
+          maxSessions: input.max_sessions,
+        }),
+      ),
   );
 
   server.registerTool(

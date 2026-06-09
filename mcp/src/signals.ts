@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 
+import { classifyCommand, classifyTestOutput } from "./command-classifier.js";
+
 /**
  * Structured per-session behavioral signals collected in the SAME parse pass
  * as event normalization (no second file walk). Everything here is counts,
@@ -54,6 +56,23 @@ export interface SessionSignals {
   /** Cursor per-model usage: model -> { costInCents, amount } sums. */
   cursorUsage: Record<string, { costInCents: number; amount: number }>;
   toolFormerStatuses: Record<string, number>;
+  /** Edit-family tool_use outcomes joined via tool_use_id (absent is_error == ok). */
+  editOutcomes: { ok: number; error: number };
+  /** All tool_use outcomes joined via tool_use_id. */
+  toolOutcomes: { ok: number; error: number };
+  /** Edits to agent-context files (fixed basename/segment allowlist; paths never stored). */
+  contextCraftEditCount: number;
+  /** Timestamps (ms) of in-transcript git_commit events (pairs with commitShaRefs). */
+  commitEventTimesMs: number[];
+  /** Classified Bash test runs with their result outcome. */
+  testRuns: Array<{ atMs: number; outcome: "pass" | "fail" }>;
+  /** AskUserQuestion answer latencies (ms) for answered questions. */
+  askAnswerLatenciesMs: number[];
+  askUnansweredCount: number;
+  /** Timestamp (ms) of the first edit-family tool_use, for plan-before-first-edit. */
+  firstEditAtMs?: number;
+  /** INTERNAL pending tool_use joins; removed by finalizeSessionSignals. */
+  pending?: Record<string, { kind: "edit" | "test" | "ask" | "other"; atMs: number | null }>;
 }
 
 export function emptySessionSignals(): SessionSignals {
@@ -85,7 +104,26 @@ export function emptySessionSignals(): SessionSignals {
     cursorLinesRemoved: 0,
     cursorUsage: {},
     toolFormerStatuses: {},
+    editOutcomes: { ok: 0, error: 0 },
+    toolOutcomes: { ok: 0, error: 0 },
+    contextCraftEditCount: 0,
+    commitEventTimesMs: [],
+    testRuns: [],
+    askAnswerLatenciesMs: [],
+    askUnansweredCount: 0,
   };
+}
+
+/** Drops internal pending-join state and tallies unanswered questions. */
+export function finalizeSessionSignals(signals: SessionSignals): void {
+  if (signals.pending) {
+    for (const entry of Object.values(signals.pending)) {
+      if (entry.kind === "ask") {
+        signals.askUnansweredCount += 1;
+      }
+    }
+    delete signals.pending;
+  }
 }
 
 const MAX_DISTINCT_KEYS = 64;
@@ -118,6 +156,29 @@ function asPositiveNumber(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 }
 
+const CONTEXT_CRAFT_BASENAMES = new Set(["claude.md", "agents.md", "skill.md", "memory.md", "rubric.md"]);
+const CONTEXT_CRAFT_SEGMENTS = ["/.cursor/rules", "/.agents/skills", "/.claude/skills", "/.claude/agents"];
+const MAX_TEST_RUNS = 500;
+const MAX_ASK_LATENCIES = 200;
+
+function recordTimestampMs(record: Record<string, unknown>): number | null {
+  const raw = record.timestamp;
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function isContextCraftPath(filePath: string): boolean {
+  const lower = filePath.toLowerCase();
+  const basename = lower.split("/").pop() ?? "";
+  if (CONTEXT_CRAFT_BASENAMES.has(basename)) {
+    return true;
+  }
+  return CONTEXT_CRAFT_SEGMENTS.some((segment) => lower.includes(segment));
+}
+
 /** Collects signals from one Claude Code JSONL record. */
 export function collectClaudeSignals(signals: SessionSignals, salt: string, record: Record<string, unknown>): void {
   const type = asString(record.type);
@@ -133,6 +194,10 @@ export function collectClaudeSignals(signals: SessionSignals, salt: string, reco
     const sha = asString(record.sha);
     if (sha && signals.commitShaRefs.length < MAX_COMMIT_REFS) {
       signals.commitShaRefs.push(saltedRef(salt, "commit", sha.toLowerCase()));
+      const ms = recordTimestampMs(record);
+      if (ms !== null) {
+        signals.commitEventTimesMs.push(ms);
+      }
     }
     return;
   }
@@ -165,6 +230,7 @@ export function collectClaudeSignals(signals: SessionSignals, salt: string, reco
     }
     const content = message.content;
     if (Array.isArray(content)) {
+      const atMs = recordTimestampMs(record);
       for (const item of content) {
         const block = asRecord(item);
         if (!block || block.type !== "tool_use") {
@@ -181,11 +247,64 @@ export function collectClaudeSignals(signals: SessionSignals, salt: string, reco
         if (name === "AskUserQuestion") {
           signals.askUserQuestionCount += 1;
         }
+        const id = asString(block.id);
+        const input = asRecord(block.input);
+        let kind: "edit" | "test" | "ask" | "other" = "other";
+        if (name === "Edit" || name === "Write" || name === "MultiEdit" || name === "NotebookEdit") {
+          kind = "edit";
+          if (signals.firstEditAtMs === undefined && atMs !== null) {
+            signals.firstEditAtMs = atMs;
+          }
+          const filePath = input ? asString(input.file_path) : undefined;
+          if (filePath && isContextCraftPath(filePath)) {
+            signals.contextCraftEditCount += 1;
+          }
+        } else if (name === "Bash") {
+          const command = input && typeof input.command === "string" ? input.command : "";
+          if (command && classifyCommand(command) === "test") {
+            kind = "test";
+          }
+        } else if (name === "AskUserQuestion") {
+          kind = "ask";
+        }
+        if (id) {
+          (signals.pending ??= {})[id] = { kind, atMs };
+        }
       }
     }
   }
   if (type === "user" && message) {
     const content = message.content;
+    if (Array.isArray(content)) {
+      const resultMs = recordTimestampMs(record);
+      for (const item of content) {
+        const block = asRecord(item);
+        if (!block || block.type !== "tool_result") {
+          continue;
+        }
+        const toolUseId = asString(block.tool_use_id);
+        const pending = toolUseId && signals.pending ? signals.pending[toolUseId] : undefined;
+        if (!pending || !toolUseId) {
+          continue;
+        }
+        delete signals.pending?.[toolUseId];
+        const isError = block.is_error === true;
+        signals.toolOutcomes[isError ? "error" : "ok"] += 1;
+        if (pending.kind === "edit") {
+          signals.editOutcomes[isError ? "error" : "ok"] += 1;
+        } else if (pending.kind === "test") {
+          const text = toolResultText(block);
+          const outcome = isError ? "fail" : classifyTestOutput(text);
+          if (outcome && signals.testRuns.length < MAX_TEST_RUNS && resultMs !== null) {
+            signals.testRuns.push({ atMs: resultMs, outcome });
+          }
+        } else if (pending.kind === "ask") {
+          if (resultMs !== null && pending.atMs !== null && signals.askAnswerLatenciesMs.length < MAX_ASK_LATENCIES) {
+            signals.askAnswerLatenciesMs.push(Math.max(0, resultMs - pending.atMs));
+          }
+        }
+      }
+    }
     const text =
       typeof content === "string"
         ? content
@@ -201,6 +320,23 @@ export function collectClaudeSignals(signals: SessionSignals, salt: string, reco
       signals.interruptCount += 1;
     }
   }
+}
+
+function toolResultText(block: Record<string, unknown>): string {
+  const content = block.content;
+  if (typeof content === "string") {
+    return content.slice(0, 4000);
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        const inner = asRecord(item);
+        return inner && typeof inner.text === "string" ? inner.text : "";
+      })
+      .join("\n")
+      .slice(0, 4000);
+  }
+  return "";
 }
 
 /** Collects signals from one Codex rollout JSONL record. */
