@@ -13,6 +13,12 @@ whole submission.
 This tool is **open source** and runs in **your** agent — you can read every line, watch it work,
 and diff the exact payload with `--dry-run` before anything is sent.
 
+The bundled MCP server also provides local-only discovery helpers:
+`discover_local_sources()`, `build_episode_candidates()`, and `git_aggregate_metrics()`. These
+helpers read Claude/Codex/Cursor transcript stores and host-side git metadata for the selected
+project, but send nothing over the network. Cursor extraction uses `sqlite3` against Cursor's
+`state.vscdb` in read-only immutable mode and only counts project-scoped rows.
+
 ---
 
 ## What leaves your machine (allowlisted, redacted)
@@ -54,7 +60,7 @@ client telemetry.
 | Secrets, API keys, tokens, JWTs, PEM keys, DB URLs with creds | Layer-1 secret scrubber, fail-closed. |
 | Other repos, remotes, org names | **Project-scoped only.** The skill analyzes the one chosen project and never enumerates, catalogs, or transmits other repos/remotes/orgs. `repos_considered` is asserted `== 1`. |
 | `~/.ssh`, `~/.aws`, keychains, env files, the docker socket | Out of scope; the analyzer reads only agent-transcript locations + host-side `git`. |
-| A second persisted copy of your raw data | Any working cache is **ephemeral** and purged on completion. No `~/.viber/cache` of raw transcripts. |
+| A second persisted copy of your raw data | Any working cache is **ephemeral** and purged on completion. No `~/.viber/cache` of raw transcripts. The score replay cache stores only request digests and returned nonce payloads. |
 
 > Two of these rows — **host-side git derivation** (never reading working-tree blobs) and the
 > **ephemeral cache** (no second persisted copy) — are guarantees of the open-source client/runtime,
@@ -96,6 +102,10 @@ canonical_scores)`, where `digest = SHA-256(JCS({episode_id, type, scores}))` an
 canonical JSON. The `handle` binding stops a nonce issued to one developer being replayed in
 another's submission.
 
+The proxy also stores a server-computed `request_digest` for the redacted score request. Retrying
+the same score request with the same submission token returns the already-issued nonce instead of
+minting a duplicate nonce that would later trip the full-coverage guard.
+
 On submission, public-dj does **not** merely check that the nonce exists — it **recomputes** the
 digest and HMAC from the *submitted* episode using its own key, and treats the **proxy-log scores as
 authoritative** (overwriting whatever the client submitted). It also (a) requires the submitted
@@ -103,8 +113,9 @@ episodes to cover **every** `request_id` the proxy issued for that submission to
 cannot silently drop low-scoring episodes, and (b) **recomputes all aggregates** (`dimensions.*`,
 `overall_score`, `overall_grade`) from the verified episode scores — the headline numbers users see
 are server-derived, not client-asserted. Any episode that fails recomputation is **held**
-(`verified=false`), never trusted. Profiles are **append-only and non-editable** — re-running
-regenerates and replaces; there is no manual edit path.
+(`verified=false`), never trusted. Profiles are **append-only and non-editable**. Exact duplicate
+submits return the existing snapshot receipt instead of appending a duplicate; changed submissions
+append a new snapshot. There is no manual edit path.
 
 ## Verify it yourself
 

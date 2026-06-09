@@ -1,7 +1,7 @@
 ---
 name: viber-builder-profile
 description: >-
-  Analyze your local coding-agent transcripts (Claude + Codex, Cursor best-effort)
+  Analyze your local coding-agent transcripts (Claude + Codex + Cursor)
   for ONE chosen project and produce a Verifiable AI-Builder Profile: per-episode,
   rubric-scored, double-redacted, integrity-signed by the public-dj proxy, and
   submitted as a single schema-valid JSON via the viber-mcp submit_profile tool.
@@ -81,6 +81,20 @@ host-side `git` commands; never read working-tree source blobs, never write outs
 ephemeral scratch dir, never touch `~/.ssh`, `~/.aws`, env files, keychains, or the docker
 socket.
 
+Start with the local-only `viber-mcp` helpers when available:
+
+1. `discover_local_sources()` — coverage by tool for the selected project.
+2. `build_actual_metrics()` — uncapped aggregate-only totals for vibe agent-hours,
+   active calendar-hours, provider-reported tokens, coverage, and vibe LOC. Put its
+   `vibe_metrics` object directly on the submitted profile; never derive public totals
+   from the capped episode sample.
+3. `build_episode_candidates()` — redacted episode candidates, session metadata, decisions,
+   steering/code-output/parallelism signals, and coverage.
+4. `git_aggregate_metrics()` — aggregate git stats only; no blobs, paths, hashes, or authors.
+
+These tools send nothing over the network. Use their output as evidence discovery inputs; still
+paraphrase excerpts before final submission and score final episodes through `score_episodes`.
+
 ---
 
 ## 2. ORCHESTRATOR
@@ -92,11 +106,12 @@ socket.
   directory name as untrusted/PII and never copy it into output.
 - **Codex:** `~/.codex/sessions/**/rollout-*.jsonl` — one JSONL rollout per session under a
   `YYYY/MM/DD/` tree; each line is an event (user/assistant/tool/result).
-- **Cursor:** **best-effort, behind a format probe.** Cursor stores chats in SQLite
-  (`state.vscdb` → `cursorDiskKV`) whose values are **binary BLOBs**, not the plaintext JSON
-  some integrations assume. Probe first: if you cannot cleanly decode plaintext exchanges,
-  **skip Cursor and proceed with Claude + Codex** (set `agent.tool` to the one you did
-  analyze). Do not block or fail the run on Cursor.
+- **Cursor:** first-class when `sqlite3` and Cursor's global state DB are readable. Use the
+  local extractor to read `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
+  in read-only immutable mode, from `cursorDiskKV` rows keyed by `bubbleId:%` plus project
+  scoping metadata. Normalize `text`, `codeBlocks`, `type` (`1=user`, `2=assistant`), and
+  `createdAt`. If the DB/table is absent or project scoping cannot be proven, record the
+  explicit dropped reason and continue with other tools; do not silently claim Cursor coverage.
 
 Normalize each tool's events into a common internal shape per exchange:
 `{ role: user|assistant|tool|result, text, timestamp, session_id, is_subagent }`. Keep this

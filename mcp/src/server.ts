@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { resolveConfig, type ViberMcpConfig } from "./config.js";
+import { buildActualMetrics, buildEpisodeCandidates, discoverLocalSources, gitAggregateMetrics } from "./extractors.js";
 import { buildAnalysisManifest } from "./manifest.js";
 import { scoreEpisodes } from "./score.js";
 import { submitProfile } from "./submit.js";
@@ -34,6 +35,14 @@ export function renderViberMcpHelp(): string {
     "viber-mcp — submit a Verifiable AI-Builder profile (stdio MCP server)",
     "",
     "Tools:",
+    "  discover_local_sources()  Local-only transcript coverage by tool for the",
+    "                            selected project. Sends nothing over the network.",
+    "  build_episode_candidates() Local-only, redacted episode candidates and",
+    "                            deterministic signals for Claude/Codex/Cursor.",
+    "  build_actual_metrics()    Local-only, uncapped aggregate totals for hours,",
+    "                            provider tokens, coverage, and vibe LOC.",
+    "  git_aggregate_metrics()   Host-side aggregate git stats only; no hashes,",
+    "                            authors, paths, filenames, or blob reads.",
     "  submit_profile(profile)   Validate the profile against the frozen allowlist",
     "                            schema (ajv) + re-scan every text field with both",
     "                            redaction layers, then POST it to the public-dj",
@@ -55,6 +64,8 @@ export function renderViberMcpHelp(): string {
     "  VIBER_PUBLIC_DJ_BASE_URL  public-dj base URL (default https://viber.minutework.ai).",
     "  VIBER_INGEST_URL          Override the full ingest URL.",
     "  VIBER_SCORE_URL           Override the full score proxy URL.",
+    "  VIBER_SELECTED_PROJECT_PATH Project path selected by upload.sh (default cwd).",
+    "  VIBER_SCRATCH_DIR          Ephemeral 0700 scratch dir for digest-only replay cache.",
     "  VIBER_DRY_RUN             '1'/'true' to force dry-run.",
   ].join("\n");
 }
@@ -64,6 +75,81 @@ export function createViberMcpServer(config: ViberMcpConfig) {
     name: "viber-mcp",
     version: "1.0.0",
   });
+
+  server.registerTool(
+    "discover_local_sources",
+    {
+      description:
+        "Local-only discovery for the selected project's Claude, Codex, and Cursor transcript coverage. " +
+        "Returns counts, opaque refs, and dropped reasons only. Sends nothing over the network and never returns paths.",
+      inputSchema: {
+        max_sessions: z
+          .number()
+          .int()
+          .positive()
+          .max(5000)
+          .optional()
+          .describe("Optional local scan cap. Defaults to 1000 sessions."),
+      },
+    },
+    async (input: { max_sessions?: number }) =>
+      createStructuredToolResult(
+        discoverLocalSources({
+          projectPath: config.selectedProjectPath,
+          maxSessions: input.max_sessions,
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "build_actual_metrics",
+    {
+      description:
+        "Local-only uncapped aggregate metrics for the selected project. Computes actual vibe agent-hours, " +
+        "de-duplicated active calendar-hours, provider-reported token totals where reliable, per-tool coverage, " +
+        "and vibe LOC from git aggregates. Returns only numbers/statuses/timestamps/opaque scope; no raw transcripts, " +
+        "paths, filenames, identifiers, hashes, or code. Sends nothing over the network.",
+      inputSchema: {},
+    },
+    async () => createStructuredToolResult(buildActualMetrics({ projectPath: config.selectedProjectPath })),
+  );
+
+  server.registerTool(
+    "build_episode_candidates",
+    {
+      description:
+        "Local-only deterministic evidence discovery for the selected project. Builds redacted episode candidates, " +
+        "session metadata, steering/decision/code-output signals, and coverage for Claude, Codex, and Cursor. " +
+        "Use these as inputs; paraphrase before final submission. Sends nothing over the network.",
+      inputSchema: {
+        max_sessions: z
+          .number()
+          .int()
+          .positive()
+          .max(5000)
+          .optional()
+          .describe("Optional local scan cap. Defaults to 1000 sessions."),
+      },
+    },
+    async (input: { max_sessions?: number }) =>
+      createStructuredToolResult(
+        buildEpisodeCandidates({
+          projectPath: config.selectedProjectPath,
+          maxSessions: input.max_sessions,
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "git_aggregate_metrics",
+    {
+      description:
+        "Local-only host-side git aggregate metrics for the selected project. Reads git history only, never source blobs, " +
+        "and returns no commit hashes, authors, paths, filenames, remotes, or repo names.",
+      inputSchema: {},
+    },
+    async () => createStructuredToolResult(gitAggregateMetrics({ projectPath: config.selectedProjectPath })),
+  );
 
   server.registerTool(
     "analysis_manifest",
@@ -97,6 +183,7 @@ export function createViberMcpServer(config: ViberMcpConfig) {
         episodes: input.episodes,
         token: config.token,
         scoreUrl: config.scoreUrl,
+        cacheDir: config.scratchDir,
       });
       return createStructuredToolResult({
         ok: outcome.ok,
