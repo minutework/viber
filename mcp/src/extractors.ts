@@ -89,6 +89,15 @@ export interface EpisodeCandidate {
   };
 }
 
+export type DecisionTopic =
+  | "scalability"
+  | "security"
+  | "data_modeling"
+  | "distributed_systems"
+  | "performance"
+  | "ux"
+  | "tooling";
+
 export interface DecisionCandidate {
   decision_id: string;
   type: "architecture" | "tradeoff" | "course_correction" | "scope" | "tooling" | "other";
@@ -99,6 +108,15 @@ export interface DecisionCandidate {
   reversibility: "reversible" | "costly" | "irreversible";
   outcome: "accepted" | "rejected" | "modified" | "deferred" | "unknown";
   episode_id: string;
+  /** Who raised the direction/concern first (rubric 1.1 initiative attribution). */
+  initiative: { raised_by: "human" | "agent" | "unknown" };
+  /** Deterministic outcome linkage from in-session commit/test telemetry. */
+  outcome_evidence?: {
+    commit_within_2h?: boolean;
+    test_signal_after?: "pass" | "fail" | "none";
+  };
+  /** Fixed-taxonomy topic tags (<=3) proposed by lexicon; the skill confirms or strips. */
+  topics?: DecisionTopic[];
 }
 
 export interface SessionBehaviorSignals {
@@ -446,7 +464,7 @@ export function buildEpisodeCandidates(options: LocalExtractorOptions = {}): Epi
     sessionEpisodes.forEach((events, index) => {
       const candidate = buildEpisodeCandidate(context, session, events, index);
       episodeCandidates.push(candidate);
-      decisions.push(...extractDecisionCandidates(context, candidate, events));
+      decisions.push(...extractDecisionCandidates(context, candidate, events, session.signals));
     });
   }
 
@@ -2251,20 +2269,68 @@ function buildEpisodeCandidate(
   };
 }
 
+const DECISION_KEYWORDS_RE =
+  /\b(decision|trade[- ]?off|choose|prefer|instead|rather|accepted|reject|defer|scope|constraint)\b/i;
+
+const DECISION_TOPIC_PATTERNS: Array<{ topic: DecisionTopic; pattern: RegExp }> = [
+  {
+    topic: "scalability",
+    pattern: /\b(scal(e|ing|ability)|load|throughput|backpressure|n\+1|cach(e|ing)|index(es|ing)?|shard(ing)?|rate[- ]?limit)\b/i,
+  },
+  {
+    topic: "security",
+    pattern: /\b(security|auth[nz]?|csrf|xss|injection|secret|token|permission|rbac|acl|encrypt|vulnerab)\b/i,
+  },
+  {
+    topic: "data_modeling",
+    pattern: /\b(schema|migration|data model|normali[sz]|foreign key|constraint|append[- ]only|immutab)\b/i,
+  },
+  {
+    topic: "distributed_systems",
+    pattern: /\b(distributed|queue|idempoten|eventual consistency|retry|at[- ]least[- ]once|race condition|deadlock|concurren)\b/i,
+  },
+  { topic: "performance", pattern: /\b(performance|perf\b|slow|optimi[sz]|profil(e|ing)|memory|cpu|latency)\b/i },
+  { topic: "ux", pattern: /\b(ux|user experience|usabilit|onboarding|accessib|design system|layout|copywriting)\b/i },
+  { topic: "tooling", pattern: /\b(ci\b|pipeline|tooling|linter|build system|scaffold|template|devex)\b/i },
+];
+
+function classifyDecisionTopics(text: string): DecisionTopic[] {
+  const topics: DecisionTopic[] = [];
+  for (const { topic, pattern } of DECISION_TOPIC_PATTERNS) {
+    if (pattern.test(text)) {
+      topics.push(topic);
+      if (topics.length >= 3) {
+        break;
+      }
+    }
+  }
+  return topics;
+}
+
 function extractDecisionCandidates(
   context: ExtractorContext,
   episode: EpisodeCandidate,
   events: NormalizedEvent[],
+  signals?: SessionSignals,
 ): DecisionCandidate[] {
   const candidates: DecisionCandidate[] = [];
   for (let index = 1; index < events.length; index += 1) {
-    const previous = events[index - 1];
     const current = events[index];
     if (!current.humanPrompt) {
       continue;
     }
+    // Anchor the proposal on the nearest preceding ASSISTANT message (skipping
+    // tool/result plumbing) so the exchange is a real proposal->response pair;
+    // fall back to the adjacent event when no assistant message is close.
+    let previous = events[index - 1];
+    for (let back = index - 1; back >= Math.max(0, index - 6); back -= 1) {
+      if (events[back].role === "assistant") {
+        previous = events[back];
+        break;
+      }
+    }
     const pairText = `${previous.text}\n${current.text}`;
-    if (!/\b(decision|trade[- ]?off|choose|prefer|instead|rather|accepted|reject|defer|scope|constraint)\b/i.test(pairText)) {
+    if (!DECISION_KEYWORDS_RE.test(pairText)) {
       continue;
     }
     const proposal = safeRedactedText(previous.text, 260);
@@ -2272,16 +2338,46 @@ function extractDecisionCandidates(
     if (!proposal || !response) {
       continue;
     }
+    // Initiative: who put the decision language on the table first.
+    const agentRaised = previous.role === "assistant" && DECISION_KEYWORDS_RE.test(previous.text);
+    const humanRaised = DECISION_KEYWORDS_RE.test(current.text);
+    const raisedBy = agentRaised ? "agent" : humanRaised ? "human" : "unknown";
+    // Outcome linkage: did a commit land within 2h, and what did tests say next.
+    const decisionMs = parseTimestampMs(current.timestamp);
+    let outcomeEvidence: DecisionCandidate["outcome_evidence"];
+    if (decisionMs !== null && signals) {
+      const commitWithin2h = signals.commitEventTimesMs.some(
+        (ms) => ms > decisionMs && ms - decisionMs <= 2 * 60 * 60 * 1000,
+      );
+      const nextTest = [...signals.testRuns].sort((left, right) => left.atMs - right.atMs).find((run) => run.atMs > decisionMs);
+      outcomeEvidence = {
+        commit_within_2h: commitWithin2h,
+        test_signal_after: nextTest ? nextTest.outcome : "none",
+      };
+    }
+    // Outcome-linked confidence replaces the old hardcoded 0.55: validated
+    // decisions (shipped + tests passing) are more trustworthy evidence.
+    let confidence = 0.5;
+    if (outcomeEvidence?.commit_within_2h) {
+      confidence += 0.15;
+    }
+    if (outcomeEvidence?.test_signal_after === "pass") {
+      confidence += 0.1;
+    }
+    const topics = classifyDecisionTopics(pairText);
     candidates.push({
       decision_id: opaqueRef(context.salt, "decision", episode.episode_id, String(index)),
       type: classifyDecisionType(pairText),
       proposal: `A local agent or prior step proposed: ${proposal}`,
       response: `The builder responded: ${response}`,
-      confidence: 0.55,
+      confidence: Math.round(confidence * 100) / 100,
       significance: "medium",
       reversibility: "reversible",
       outcome: inferDecisionOutcome(current.text),
       episode_id: episode.episode_id,
+      initiative: { raised_by: raisedBy },
+      ...(outcomeEvidence ? { outcome_evidence: outcomeEvidence } : {}),
+      ...(topics.length > 0 ? { topics } : {}),
     });
     if (candidates.length >= 3) {
       break;

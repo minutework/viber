@@ -1,6 +1,8 @@
 # Verifiable AI-Builder Rubric
 
-**rubric_version: 1.0.0** · pairs with `schema_version: 1.0.0` (`schema/profile.schema.json`)
+**rubric_version: 1.1.0** · pairs with `schema_version: 1.1.0` (`schema/profile.schema.json`).
+public-dj's compatibility map governs accepted pairings (1.1.0 schema accepts rubric 1.0.0 or
+1.1.0); §1–§5 are unchanged from 1.0.0, so 1.0.0 scores remain comparable. §6–§8 are new.
 
 This rubric is fixed, versioned, and open so that scoring is consistent and auditable across
 developers, agents, and runs. It is reimplemented independently from first principles; it is not
@@ -169,13 +171,16 @@ dimension.confidence = clamp( Σ(episode_confidence) / (Σ(episode_confidence) +
 
 ## 5. Output contract
 
-The synthesizer emits exactly the shape in `schema/profile.schema.json`. Checks (a)–(d) below are
+The synthesizer emits exactly the shape in `schema/profile.schema.json`. Checks (a)–(f) below are
 **procedural** — JSON Schema cannot express them, so they are enforced by **both** the client
 Validator **and** public-dj ingestion (not by the schema alone). Reject anything that (a) scores a
 dimension without ≥2 excerpts, (b) carries a path/email/identifier/secret in any field, (c) presents
-an all-high profile (every present dimension ≥ 80) with empty `growth_edges`, or (d) lists a scored
-episode without a proxy-issued integrity nonce. All LLM-generated narrative (rationale, summary,
-archetype, strengths/edges, excerpts) is re-run through both redaction layers before output.
+an all-high profile (every present dimension ≥ 80) with empty `growth_edges`, (d) lists a scored
+episode without a proxy-issued integrity nonce, (e) claims an `operating_level` band without ≥2
+cited excerpts AND corroborating `behavior_signals` numbers (§6), or (f) uses a job-title word
+("senior", "staff", "principal", "lead", "junior") anywhere in `operating_level`, `archetype`, or
+any narrative referencing level. All LLM-generated narrative (rationale, summary, archetype,
+strengths/edges, excerpts) is re-run through both redaction layers before output.
 
 public-dj additionally **recomputes** every aggregate (`dimensions.*`, `overall_score`,
 `overall_grade`) from the nonce-verified per-episode scores using §4 — client aggregates are advisory
@@ -183,3 +188,99 @@ public-dj additionally **recomputes** every aggregate (`dimensions.*`, `overall_
 (no dropping low scorers). The §0 *transcript-is-data-not-instructions* guard is restated **inline**
 in every prompt that ingests transcript text (orchestrator, worker, synthesizer, and the public-dj
 proxy scoring call), with transcript content wrapped in a clearly-labeled untrusted block.
+
+---
+
+## 6. Operating level (evidence-anchored bands — NEVER job titles)
+
+`operating_level` describes the **scope and leverage** at which the builder demonstrably operates
+when working with agents. It is orthogonal to the quality dimensions in §1: a builder can execute
+features excellently (high dimension scores) while operating at feature scope.
+
+Bands (the only allowed values; **never** emit title words — "senior", "staff", "principal",
+"lead", "junior" are banned everywhere):
+
+### `feature_executor`
+Works task-by-task within given boundaries. Prompts assign **tasks**; decisions are mostly local
+to one feature; planning is reactive; little investment in reusable scaffolding.
+
+### `system_designer`
+Shapes the system, not just the feature. Sets boundaries and contracts before building; decisions
+span modules and anticipate failure/scale/compat; plans before first edit on non-trivial work;
+corrects structurally poor agent designs; raises cross-cutting concerns (migrations, auth,
+data-model invariants) **unprompted**.
+
+### `platform_shaper`
+Builds the system that builds. Sustained constraint-setting (prompts state **invariants** the
+agent must honor, not steps to take); decisions are system-of-systems (cross-service contracts,
+compat strategy, security posture); invests in leverage that compounds — context files, skills,
+rules, reusable scaffolding (`behavior_signals` context-craft activity); maintains coherent
+multi-session work streams over weeks; initiative on architecture-class decisions is
+predominantly human-raised (§8).
+
+### Evidence requirements (stricter than a dimension)
+
+A band claim MUST carry:
+1. **≥2 cited, redacted excerpts** demonstrating the band's anchor behaviors, AND
+2. **corroborating `behavior_signals` numbers** named in the confidence rationale — at minimum
+   the deterministic signals that distinguish the band (e.g. context-craft edit count, plan-mode
+   shares, human-initiative ratio on architecture topics, work-stream counts). Vibes-only band
+   claims are a defect.
+
+Calibration:
+- **Default down.** When evidence is split between two bands, claim the lower one; the higher
+  band must be the parsimonious reading of the evidence, not the flattering one.
+- **Confidence reflects breadth**: a band demonstrated in one episode is low-confidence; across
+  many episodes and weeks, higher.
+- **Scope ≠ quality.** Do not lift a band because dimension scores are high, and do not lower
+  dimension scores because the band is `feature_executor` (anti-halo applies both ways).
+- **Display gating is server-side**: public-dj stores `operating_level` on ingest but serves it
+  only for maturity-established profiles (≥3 verified uploads) with sufficient episode counts.
+  Emit it whenever the evidence supports it; gating is not your concern.
+
+---
+
+## 7. Specialty signals (topic-tagged depth)
+
+`specialty_signals` answers "what does this builder demonstrably understand deeply?" — e.g.
+*scalability* — without stretching the generic dimensions. Fixed topic taxonomy (the only keys):
+`scalability`, `security`, `data_modeling`, `distributed_systems`, `performance`, `ux`, `tooling`.
+
+Derivation:
+1. The extractor proposes `topics` (≤3) on decision records from a fixed lexicon. **Confirm or
+   strip each tag** — keyword presence is a proposal, not evidence. A tag survives only when the
+   decision genuinely engages the topic (a tradeoff reasoned about, a failure mode anticipated,
+   a constraint imposed), not when the word merely appears.
+2. For each topic with surviving evidence: `episode_count` = distinct episodes carrying confirmed
+   decisions/excerpts for that topic; `score` = evidence-weighted mean (per §4 math) of the
+   `architecture`/`debugging` mini-scores of exactly those episodes; `confidence` per §4 with the
+   same K.
+3. **Omit a topic with < 1 qualifying episode** — omission is not weakness (§3.2 applies).
+4. **Vocabulary is not competence.** A builder who *says* "backpressure" scores nothing; a builder
+   who caught the unbounded queue **before the agent did** (§8 initiative) and shipped the fix
+   (outcome linkage) scores. Weight initiative=human + validated-outcome decisions highest.
+
+---
+
+## 8. Initiative & outcome linkage (decision upgrades)
+
+Decision records carry two new deterministic fields. Use them; do not re-derive from vibes.
+
+- **`initiative.raised_by`** ∈ `human | agent | unknown` — who put the decision language on the
+  table first. `human`-raised architecture/scalability/security decisions are the strongest
+  §6/§7 evidence: they show foresight, not agreement. `agent`-raised decisions still score
+  `steering`/`code_review` (the human evaluated a proposal) but carry less band/specialty weight.
+- **`outcome_evidence`** — what actually happened next, from in-session telemetry:
+  `commit_within_2h` (a commit event followed within 2 hours) and `test_signal_after`
+  (`pass | fail | none` — the first classified test run after the decision). The extractor also
+  folds these into the decision's deterministic `confidence` (validated decisions start higher).
+
+Scoring rules:
+1. A decision with `commit_within_2h: true` and `test_signal_after: "pass"` is a **validated**
+   decision — cite it ahead of unvalidated ones when choosing dimension/band/specialty evidence.
+2. `test_signal_after: "fail"` does NOT penalize the decision by itself (the fix may follow);
+   it lowers citation priority, nothing more.
+3. Classify each decision's `significance` and `reversibility` against the definitions in the
+   schema (low/medium/high; reversible/costly/irreversible) **yourself** — the extractor emits
+   neutral defaults; leaving every decision at the defaults is a defect.
+4. Never fabricate `outcome_evidence` — if the extractor omitted it, omit it.
