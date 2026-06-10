@@ -1,5 +1,6 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { createReadStream, createWriteStream, mkdirSync, openSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -10,8 +11,26 @@ import { readSubmissionToken, resolveConfig, type ViberMcpConfig } from "./confi
 import { buildWrappedAggregates } from "./aggregates.js";
 import { buildActualMetrics, buildEpisodeCandidates, discoverLocalSources, gitAggregateMetrics } from "./extractors.js";
 import { buildAnalysisManifest } from "./manifest.js";
+import { detectShippedTitleViolations, detectShippedUrlViolations } from "./redaction.js";
 import { analyzeRepoArchitecture } from "./repo-architecture.js";
 import { scoreEpisodes } from "./score.js";
+import {
+  buildShippedAggregate,
+  buildShippedWithAiBlock,
+  defaultItemForCandidate,
+  detectShippedCandidates,
+  readShippedApprovals,
+  writeShippedApprovals,
+  MAX_SHIPPED_ITEMS,
+  SHIPPED_AI_CONTRIBUTIONS,
+  SHIPPED_CATEGORIES,
+  type ApprovedShippedItem,
+  type ShippedAiContribution,
+  type ShippedApprovalsFile,
+  type ShippedCandidate,
+  type ShippedCategory,
+  type ShippedDetection,
+} from "./shipped.js";
 import { refreshProfileMetrics, submitProfile, type SubmitOutcome } from "./submit.js";
 
 export interface ViberMcpCliOptions {
@@ -27,6 +46,8 @@ export interface ParsedCliArgs {
   dryRun: boolean;
   metricsRefresh: boolean;
   scoreHealth: boolean;
+  detectShipped: boolean;
+  reviewShipped: boolean;
 }
 
 function writeSubmitResultMarker(config: ViberMcpConfig, operation: string, outcome: SubmitOutcome): void {
@@ -107,6 +128,8 @@ export function parseViberMcpCliArgs(args: string[]): ParsedCliArgs {
     dryRun: args.includes("--dry-run"),
     metricsRefresh: args.includes("--metrics-refresh"),
     scoreHealth: args.includes("--score-health"),
+    detectShipped: args.includes("--detect-shipped"),
+    reviewShipped: args.includes("--review-shipped"),
   };
 }
 
@@ -133,6 +156,9 @@ export function renderViberMcpHelp(): string {
     "  score_episodes(episodes)  POST redacted episode summaries to the public-dj",
     "                            scoring proxy using the in-memory submission token",
     "                            and return nonce-bearing scored episodes.",
+    "  get_shipped_with_ai()     Read the locally stored, CLI-approved shipped",
+    "                            outcomes and return the schema-shaped",
+    "                            shipped_with_ai block (or null). Local-only.",
     "",
     "Flags:",
     "  --dry-run                 Print the exact payload that would be sent and",
@@ -140,6 +166,15 @@ export function renderViberMcpHelp(): string {
     "  --metrics-refresh         Build uncapped deterministic metrics locally and",
     "                            POST only the metrics-refresh payload.",
     "  --score-health            Check scoring readiness and exit before analysis.",
+    "  --detect-shipped          Run local read-only shipped-candidate detection",
+    "                            over the selected project + VIBER_ARCH_REPOS and",
+    "                            print {candidates, aggregate} JSON to stdout.",
+    "                            Local-only fields stay on YOUR terminal; nothing",
+    "                            is sent anywhere.",
+    "  --review-shipped          Same detection, then an interactive /dev/tty",
+    "                            review to approve/hide candidates and persist",
+    "                            $VIBER_HOME/shipped/approved.json (0600).",
+    "                            Exits 2 when no interactive terminal is present.",
     "  -h, --help                Show this help.",
     "",
     "Environment:",
@@ -150,6 +185,10 @@ export function renderViberMcpHelp(): string {
     "  VIBER_SELECTED_PROJECT_PATH Project path selected by upload.sh (default cwd).",
     "  VIBER_SCRATCH_DIR          Ephemeral 0700 scratch dir for temp wrappers/tokens.",
     "  VIBER_CACHE_DIR            Persistent 0700 digest-only replay cache.",
+    "  VIBER_HOME                 Local viber state dir (default ~/.vibexp); holds",
+    "                             shipped/approved.json.",
+    "  VIBER_ARCH_REPOS           Colon-separated absolute repo paths included by",
+    "                             --detect-shipped/--review-shipped.",
     "  VIBER_DRY_RUN             '1'/'true' to force dry-run.",
   ].join("\n");
 }
@@ -355,6 +394,24 @@ export function createViberMcpServer(config: ViberMcpConfig) {
   );
 
   server.registerTool(
+    "get_shipped_with_ai",
+    {
+      description:
+        "Read the locally stored, user-approved shipped-with-AI outcomes ($VIBER_HOME/shipped/approved.json, " +
+        "written only by the `viber-mcp --review-shipped` CLI review) and return the schema-shaped shipped_with_ai " +
+        "block, or null when the user has not reviewed candidates or opted out. The agent MUST include the returned " +
+        "block in the profile VERBATIM and must NEVER invent, add, retitle, reorder, or embellish items — only " +
+        "explicitly CLI-approved data ships. When this returns null, the profile simply omits shipped_with_ai. " +
+        "Local-only fields (e.g. source_key) are stripped before return. Sends nothing over the network.",
+      inputSchema: {},
+    },
+    async () =>
+      createStructuredToolResult({
+        shipped_with_ai: buildShippedWithAiBlock(readShippedApprovals(config.shippedApprovalsFile)),
+      }),
+  );
+
+  server.registerTool(
     "submit_profile",
     {
       description:
@@ -413,6 +470,29 @@ export async function runViberMcpCli(options: ViberMcpCliOptions = {}): Promise<
   }
 
   const config = resolveConfig(env, parsed.dryRun);
+  if (parsed.detectShipped || parsed.reviewShipped) {
+    // Detection is local-only and read-only. stdout here is the USER'S
+    // terminal (not a network payload), so local-only fields such as
+    // repo_label / suggested_title / source_key are fine THERE — and only there.
+    const detection = detectShippedCandidates({
+      repos: [config.selectedProjectPath, ...config.archRepoPaths],
+    });
+    if (parsed.detectShipped) {
+      stdout.write(
+        `${JSON.stringify(
+          {
+            candidates: detection.candidates,
+            aggregate: buildShippedAggregate(detection.candidates),
+            warnings: detection.warnings,
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      return 0;
+    }
+    return runShippedReview(detection, config, stdout, stderr);
+  }
   if (parsed.scoreHealth) {
     const response = await fetch(config.scoreHealthUrl, {
       method: "GET",
@@ -462,6 +542,161 @@ export async function runViberMcpCli(options: ViberMcpCliOptions = {}): Promise<
     };
     server.connect(transport).catch(reject);
   });
+}
+
+/**
+ * Interactive shipped-candidate review over /dev/tty (never stdin/stdout, so
+ * piped invocations cannot fake approvals). Per candidate: y approve (with
+ * detail prompts), h hide, a approve this and all remaining with defaults,
+ * n/empty approve NONE (mode aggregate_only), o opt out entirely. Persists
+ * $VIBER_HOME/shipped/approved.json (file 0600, dir 0700). Exits 2 without
+ * writing anything when no interactive terminal is available.
+ */
+async function runShippedReview(
+  detection: ShippedDetection,
+  config: ViberMcpConfig,
+  stdout: Writable,
+  stderr: Writable,
+): Promise<number> {
+  let ttyReadFd: number;
+  let ttyWriteFd: number;
+  try {
+    ttyReadFd = openSync("/dev/tty", "r");
+    ttyWriteFd = openSync("/dev/tty", "w");
+  } catch {
+    stderr.write(
+      "viber-mcp --review-shipped requires an interactive terminal (/dev/tty is unavailable). " +
+        "Run it directly from a terminal; nothing was written.\n",
+    );
+    return 2;
+  }
+  const input = createReadStream("", { fd: ttyReadFd });
+  const output = createWriteStream("", { fd: ttyWriteFd });
+  const rl = createInterface({ input, output });
+  const say = (line: string) => output.write(`${line}\n`);
+  try {
+    const candidates = detection.candidates;
+    if (candidates.length === 0) {
+      say("No shipped candidates detected (no release/deploy/docs/PR signals in the scanned repos).");
+      say("Nothing was written.");
+      return 0;
+    }
+    say(`Detected ${candidates.length} shipped candidate(s) (local-only; nothing leaves this machine):`);
+    candidates.forEach((candidate, index) => {
+      say(
+        `  [${index + 1}] ${candidate.repo_label} ${candidate.period} — ${candidate.commit_count} commit(s), ` +
+          `categories: ${candidate.categories.join("/")}, evidence: ${candidate.evidence.join("/")}`,
+      );
+      say(`      suggested title: ${candidate.suggested_title}`);
+    });
+    say("");
+    say("Per candidate: y=approve, h=hide, a=approve ALL remaining with defaults,");
+    say("n or empty=approve NONE (share aggregate counts only), o=opt out entirely.");
+
+    const items: ApprovedShippedItem[] = [];
+    let mode: ShippedApprovalsFile["mode"] = "approved_items";
+    let stopped = false;
+    for (let index = 0; index < candidates.length && !stopped; index += 1) {
+      const candidate = candidates[index];
+      const answer = (
+        await rl.question(`[${index + 1}/${candidates.length}] ${candidate.repo_label} ${candidate.period} [y/h/a/n/o]: `)
+      )
+        .trim()
+        .toLowerCase();
+      if (answer === "o") {
+        mode = "opt_out";
+        stopped = true;
+      } else if (answer === "n" || answer === "") {
+        mode = "aggregate_only";
+        items.length = 0;
+        stopped = true;
+      } else if (answer === "a") {
+        for (let rest = index; rest < candidates.length && items.length < MAX_SHIPPED_ITEMS; rest += 1) {
+          items.push(defaultItemForCandidate(candidates[rest]));
+        }
+        stopped = true;
+      } else if (answer === "y") {
+        if (items.length >= MAX_SHIPPED_ITEMS) {
+          say(`Item cap (${MAX_SHIPPED_ITEMS}) reached; remaining candidates are counted in the aggregate only.`);
+          stopped = true;
+        } else {
+          items.push(await promptApprovedItem(rl, say, candidate));
+        }
+      } else {
+        say("  (hidden)");
+      }
+    }
+    if (mode === "approved_items" && items.length === 0) {
+      mode = "aggregate_only";
+    }
+    const approvals: ShippedApprovalsFile = {
+      version: 1,
+      updated_at: new Date().toISOString(),
+      mode,
+      items,
+      aggregate: buildShippedAggregate(candidates),
+      source_keys_reviewed: candidates.map((candidate) => candidate.source_key),
+    };
+    writeShippedApprovals(config.shippedApprovalsFile, approvals);
+    say(`Saved ${mode} (${items.length} item(s)) to ${config.shippedApprovalsFile} (0600).`);
+    stdout.write(
+      `${JSON.stringify({ mode, approved_count: items.length, file: config.shippedApprovalsFile }, null, 2)}\n`,
+    );
+    return 0;
+  } finally {
+    rl.close();
+    input.destroy();
+    output.end();
+  }
+}
+
+/** Detail prompts for one approved candidate; every default is the detected value. */
+async function promptApprovedItem(
+  rl: ReturnType<typeof createInterface>,
+  say: (line: string) => void,
+  candidate: ShippedCandidate,
+): Promise<ApprovedShippedItem> {
+  const item = defaultItemForCandidate(candidate);
+  for (;;) {
+    const title = (await rl.question(`  public title [${item.title}]: `)).trim() || item.title;
+    const violations = title.length < 3 || title.length > 120 ? ["length"] : detectShippedTitleViolations(title);
+    if (violations.length === 0) {
+      item.title = title;
+      break;
+    }
+    say(`  title rejected (${violations.join(", ")}); product names are fine, paths/secrets/code are not.`);
+  }
+  const url = (await rl.question("  public https URL (optional, Enter to skip): ")).trim();
+  if (url) {
+    const violations = detectShippedUrlViolations(url);
+    if (violations.length === 0) {
+      item.public_url = url;
+      if (item.evidence_status === "git_evidence") {
+        item.evidence_status = "public_url";
+      }
+    } else {
+      say(`  URL skipped (${violations.join(", ")}).`);
+    }
+  }
+  const category = (await rl.question(`  category ${JSON.stringify(SHIPPED_CATEGORIES)} [${item.category}]: `))
+    .trim()
+    .toLowerCase();
+  if ((SHIPPED_CATEGORIES as readonly string[]).includes(category)) {
+    item.category = category as ShippedCategory;
+  }
+  const shippedOn = (await rl.question(`  shipped on (YYYY-MM) [${item.shipped_on}]: `)).trim();
+  if (/^\d{4}-(0[1-9]|1[0-2])$/.test(shippedOn)) {
+    item.shipped_on = shippedOn;
+  }
+  const contribution = (
+    await rl.question(`  ai contribution ${JSON.stringify(SHIPPED_AI_CONTRIBUTIONS)} [${item.ai_contribution}]: `)
+  )
+    .trim()
+    .toLowerCase();
+  if ((SHIPPED_AI_CONTRIBUTIONS as readonly string[]).includes(contribution)) {
+    item.ai_contribution = contribution as ShippedAiContribution;
+  }
+  return item;
 }
 
 function osFamily(): "darwin" | "linux" | "windows" | "unknown" {

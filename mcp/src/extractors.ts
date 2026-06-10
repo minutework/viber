@@ -13,6 +13,7 @@ import {
   collectCursorComposerSignals,
   emptySessionSignals,
   finalizeSessionSignals,
+  normalizeModelId,
   type SessionSignals,
 } from "./signals.js";
 
@@ -224,6 +225,27 @@ export interface ActualMetricsToolCoverage {
   warnings: string[];
 }
 
+export interface ProfileAnalysisOverheadTool {
+  sessions: number;
+  vibe_agent_hours: number;
+  provider_tokens: number;
+}
+
+/**
+ * Aggregate-only audit of Vibexp's own profile-analysis (measurement)
+ * sessions, mirroring schema 1.3.0's vibe_metrics.profile_analysis_overhead.
+ * Counts and totals only; never used for ranking, never merged into the
+ * normal builder metrics it was excluded from.
+ */
+export interface ProfileAnalysisOverhead {
+  sessions: number;
+  vibe_agent_hours: number;
+  provider_tokens: number;
+  by_tool?: Partial<Record<AgentTool, ProfileAnalysisOverheadTool>>;
+  model_families?: string[];
+  last_analysis_at?: string;
+}
+
 export interface ActualVibeMetrics {
   metrics_scope: ActualMetricsScope;
   total_vibe_agent_hours: number;
@@ -233,6 +255,7 @@ export interface ActualVibeMetrics {
   vibe_agent_hours_by_period: MetricsPeriodBreakdown;
   active_calendar_hours_by_period: MetricsPeriodBreakdown;
   provider_tokens_by_period: MetricsPeriodBreakdown;
+  profile_analysis_overhead?: ProfileAnalysisOverhead;
   total_vibe_loc?: number;
   vibe_loc_sources?: VibeLocSources;
   vibe_loc_by_period?: MetricsPeriodBreakdown;
@@ -291,6 +314,45 @@ export interface NormalizedSession {
   remoteKey?: string;
   /** Structured behavioral signals collected in the same parse pass. */
   signals?: SessionSignals;
+  /**
+   * True when this session IS a Vibexp profile-analysis (measurement) run.
+   * Measurement sessions are excluded from EVERY normal metric — session
+   * counts, agent hours, provider tokens, prompt/model/episode/signal stats —
+   * and surface only in vibe_metrics.profile_analysis_overhead. Subagent
+   * sessions inherit the parent's classification.
+   */
+  measurementSession?: boolean;
+}
+
+/**
+ * SHARED CONTRACT (client + server + skill): a session is a measurement
+ * session iff its FIRST human prompt starts with this prefix AND contains
+ * "submit_profile". NO keyword matching anywhere else in the transcript — a
+ * developer building viber itself (whose prompts merely discuss
+ * submit_profile / viber-mcp) must NOT be classified.
+ */
+export const MEASUREMENT_PROMPT_PREFIX = "Use the viber skill at ";
+
+export function isMeasurementPrompt(firstHumanPromptText: string | undefined): boolean {
+  if (!firstHumanPromptText) {
+    return false;
+  }
+  const text = firstHumanPromptText.trimStart();
+  return text.startsWith(MEASUREMENT_PROMPT_PREFIX) && text.includes("submit_profile");
+}
+
+/**
+ * Classification text for a session: the first human prompt; when a session
+ * has NO human prompt at all (headless `claude -p` / SDK bootstrap runs mark
+ * their prompt non-human), fall back to the first user-ROLE event so the
+ * canonical upload.sh measurement run is still classified.
+ */
+function measurementClassificationText(events: NormalizedEvent[]): string | undefined {
+  const sorted = sortEvents(events);
+  const firstHuman =
+    sorted.find((event) => event.humanPrompt) ??
+    sorted.find((event) => event.role === "user" && !event.isSubagent);
+  return firstHuman?.text;
 }
 
 interface CollectorResult {
@@ -310,6 +372,10 @@ interface ActualSessionMetric {
   timestampMs: number[];
   tokenUsage?: TokenUsage;
   tokenEvents?: TokenUsageEvent[];
+  /** Measurement (profile-analysis) session flag; see NormalizedSession.measurementSession. */
+  measurement?: boolean;
+  /** Raw provider model ids observed in this session (local-only; normalized before any output). */
+  models?: string[];
 }
 
 interface ActualCollectorResult {
@@ -342,7 +408,8 @@ interface TokenUsageEvent {
 
 export function discoverLocalSources(options: LocalExtractorOptions = {}): LocalSourceDiscovery {
   const context = createExtractorContext(options);
-  const collected = collectAllSessions(context);
+  // Measurement (profile-analysis) sessions never count as builder coverage.
+  const collected = excludeMeasurementSessions(collectAllSessions(context));
   const tools = makeCoverage(collected);
   const totals = Object.values(tools).reduce(
     (acc, tool) => {
@@ -364,11 +431,21 @@ export function discoverLocalSources(options: LocalExtractorOptions = {}): Local
 
 export function buildActualMetrics(options: LocalExtractorOptions = {}): ActualMetricsBundle {
   const context = createExtractorContext(options);
-  const collectors = [
+  const rawCollectors = [
     collectActualClaudeMetrics(context),
     collectActualCodexMetrics(context),
     collectActualCursorMetrics(context),
   ];
+  // Measurement (profile-analysis) sessions are excluded from EVERY normal
+  // metric below. DELIBERATE DIVERGENCE from the subagent precedent: their
+  // provider tokens are excluded from the normal totals too — they appear
+  // ONLY in the profile_analysis_overhead block.
+  const collectors = rawCollectors.map((collector) => ({
+    ...collector,
+    sessions: collector.sessions.filter((session) => session.measurement !== true),
+    subagentSessions: (collector.subagentSessions ?? []).filter((session) => session.measurement !== true),
+  }));
+  const profileAnalysisOverhead = buildProfileAnalysisOverhead(rawCollectors);
   const gitMetrics = gitAggregateMetrics(options);
   const warnings = [...collectors.flatMap((collector) => collector.warnings), ...gitMetrics.warnings];
   const allSessions = collectors.flatMap((collector) => collector.sessions);
@@ -437,6 +514,7 @@ export function buildActualMetrics(options: LocalExtractorOptions = {}): ActualM
     vibe_agent_hours_by_period: hoursByPeriod(agentIntervals),
     active_calendar_hours_by_period: hoursByPeriod(mergedCalendarIntervals),
     provider_tokens_by_period: tokensByPeriod(tokenEvents),
+    ...(profileAnalysisOverhead ? { profile_analysis_overhead: profileAnalysisOverhead } : {}),
     ...(gitMetrics.git_metrics
       ? {
           total_vibe_loc: gitMetrics.git_metrics.lines_added,
@@ -467,9 +545,97 @@ export function buildActualMetrics(options: LocalExtractorOptions = {}): ActualM
   };
 }
 
+/**
+ * Aggregates measurement (profile-analysis) sessions into the schema 1.3.0
+ * profile_analysis_overhead block. Returns undefined when there are ZERO
+ * measurement sessions so the block is omitted entirely.
+ */
+function buildProfileAnalysisOverhead(collectors: ActualCollectorResult[]): ProfileAnalysisOverhead | undefined {
+  const byTool: Partial<Record<AgentTool, ProfileAnalysisOverheadTool>> = {};
+  let totalSessions = 0;
+  let totalMinutes = 0;
+  let totalTokens = 0;
+  let measurementCount = 0;
+  let lastMs = Number.NEGATIVE_INFINITY;
+  const families = new Set<string>();
+  for (const collector of collectors) {
+    const mains = collector.sessions.filter((session) => session.measurement === true);
+    const subs = (collector.subagentSessions ?? []).filter((session) => session.measurement === true);
+    if (mains.length + subs.length === 0) {
+      continue;
+    }
+    measurementCount += mains.length + subs.length;
+    // Same conventions as the normal totals: subagent sidechains run
+    // concurrently with their parent, so they contribute tokens but not
+    // session counts or agent-hours.
+    const minutes = mains.reduce((sum, session) => sum + activeMinutes(session.timestampMs), 0);
+    const tokens = sumTokenUsage(
+      [...mains, ...subs].flatMap((session) => (session.tokenUsage ? [session.tokenUsage] : [])),
+    ).total;
+    for (const session of [...mains, ...subs]) {
+      for (const timestamp of session.timestampMs) {
+        if (timestamp > lastMs) {
+          lastMs = timestamp;
+        }
+      }
+      for (const rawModel of session.models ?? []) {
+        const family = normalizeModelId(rawModel);
+        if (family) {
+          families.add(family);
+        }
+      }
+    }
+    byTool[collector.tool] = {
+      sessions: mains.length,
+      vibe_agent_hours: roundHours(minutes),
+      provider_tokens: tokens,
+    };
+    totalSessions += mains.length;
+    totalMinutes += minutes;
+    totalTokens += tokens;
+  }
+  if (measurementCount === 0) {
+    return undefined;
+  }
+  const modelFamilies = Array.from(families).sort().slice(0, 12);
+  return {
+    sessions: totalSessions,
+    vibe_agent_hours: roundHours(totalMinutes),
+    provider_tokens: totalTokens,
+    ...(Object.keys(byTool).length > 0 ? { by_tool: byTool } : {}),
+    ...(modelFamilies.length > 0 ? { model_families: modelFamilies } : {}),
+    ...(Number.isFinite(lastMs) ? { last_analysis_at: new Date(lastMs).toISOString() } : {}),
+  };
+}
+
+/**
+ * Drops measurement (profile-analysis) sessions from collector results so the
+ * episode/coverage paths never count them, recording the exclusion in
+ * dropped_reasons for local debuggability.
+ */
+function excludeMeasurementSessions(collected: CollectorResult[]): CollectorResult[] {
+  return collected.map((entry) => {
+    const kept = entry.sessions.filter((session) => session.measurementSession !== true);
+    const excluded = entry.sessions.length - kept.length;
+    if (excluded === 0) {
+      return entry;
+    }
+    return {
+      ...entry,
+      sessions: kept,
+      droppedReasons: {
+        ...entry.droppedReasons,
+        measurement_session_excluded: (entry.droppedReasons.measurement_session_excluded ?? 0) + excluded,
+      },
+    };
+  });
+}
+
 export function buildEpisodeCandidates(options: LocalExtractorOptions = {}): EpisodeCandidateBundle {
   const context = createExtractorContext(options);
-  const collected = collectAllSessions(context);
+  // Measurement sessions are excluded from EVERY candidate/metadata/signal
+  // block here; they only surface in vibe_metrics.profile_analysis_overhead.
+  const collected = excludeMeasurementSessions(collectAllSessions(context));
   const allSessions = collected.flatMap((entry) => entry.sessions);
   const episodeCandidates: EpisodeCandidate[] = [];
   const sessionMetadata: SessionMetadataCandidate[] = [];
@@ -544,6 +710,9 @@ export function buildEpisodeCandidates(options: LocalExtractorOptions = {}): Epi
 /**
  * Normalized session access for the aggregates module (Wave 2). Same
  * collectors and scope rules as buildEpisodeCandidates; LOCAL-only data.
+ * Sessions keep their measurementSession flag — consumers MUST filter
+ * measurement sessions out of every normal metric (aggregates.ts does this
+ * once at the top of buildWrappedAggregates).
  */
 export interface CollectedNormalizedSessions {
   sessions: NormalizedSession[];
@@ -581,8 +750,14 @@ export function collectActualSessionData(options: LocalExtractorOptions = {}): {
   const sessions: ActualSessionData[] = [];
   const toEvents = (session: ActualSessionMetric) =>
     (session.tokenEvents ?? []).map((event) => ({ timestampMs: event.timestampMs, total: event.usage.total }));
+  // Measurement (profile-analysis) sessions are dropped here so every
+  // aggregates.ts consumer (concurrency, identity, economics, last-30-days)
+  // excludes them by construction.
   for (const collector of collectors) {
     for (const session of collector.sessions) {
+      if (session.measurement === true) {
+        continue;
+      }
       sessions.push({
         tool: collector.tool,
         timestampMs: session.timestampMs,
@@ -592,6 +767,9 @@ export function collectActualSessionData(options: LocalExtractorOptions = {}): {
       });
     }
     for (const session of collector.subagentSessions ?? []) {
+      if (session.measurement === true) {
+        continue;
+      }
       sessions.push({
         tool: collector.tool,
         timestampMs: session.timestampMs,
@@ -1130,6 +1308,8 @@ function collectActualClaudeMetrics(context: ExtractorContext): ActualCollectorR
   }
   const sessions: ActualSessionMetric[] = [];
   const subagentSessions: ActualSessionMetric[] = [];
+  const measurementByMainPath = new Map<string, boolean>();
+  const pendingSubagents: Array<{ parentPath: string; metric: ActualSessionMetric }> = [];
   for (const filePath of files) {
     let content = "";
     try {
@@ -1154,11 +1334,28 @@ function collectActualClaudeMetrics(context: ExtractorContext): ActualCollectorR
     if (parsed.timestampMs.length === 0) {
       continue;
     }
-    const metric: ActualSessionMetric = { tool: "claude", ...parsed, tokenEvents: collectClaudeTokenEvents(content) };
-    if (claudeSubagentParent(filePath)) {
+    const scan = scanJsonlMeasurementSignals("claude", content);
+    const metric: ActualSessionMetric = {
+      tool: "claude",
+      ...parsed,
+      tokenEvents: collectClaudeTokenEvents(content),
+      measurement: scan.measurement,
+      ...(scan.models.length > 0 ? { models: scan.models } : {}),
+    };
+    const parentPath = claudeSubagentParent(filePath);
+    if (parentPath) {
+      pendingSubagents.push({ parentPath, metric });
       subagentSessions.push(metric);
     } else {
+      measurementByMainPath.set(filePath, scan.measurement);
       sessions.push(metric);
+    }
+  }
+  // Subagent sessions inherit the parent transcript's classification.
+  for (const { parentPath, metric } of pendingSubagents) {
+    const parentFlag = measurementByMainPath.get(parentPath);
+    if (parentFlag !== undefined) {
+      metric.measurement = parentFlag;
     }
   }
   return {
@@ -1293,7 +1490,14 @@ function collectActualCodexMetrics(context: ExtractorContext): ActualCollectorRe
         return codexTokenUsage(usage) ?? currentUsage;
       });
       if (parsed.timestampMs.length > 0) {
-        sessions.push({ tool: "codex", ...parsed, tokenEvents: collectCodexTokenDeltaEvents(content) });
+        const scan = scanJsonlMeasurementSignals("codex", content);
+        sessions.push({
+          tool: "codex",
+          ...parsed,
+          tokenEvents: collectCodexTokenDeltaEvents(content),
+          measurement: scan.measurement,
+          ...(scan.models.length > 0 ? { models: scan.models } : {}),
+        });
       }
     }
   }
@@ -1355,7 +1559,9 @@ function collectActualCursorMetrics(context: ExtractorContext): ActualCollectorR
       const endKey = `bubbleId:${composerId};`;
       const bubbleSql = [
         "SELECT json_extract(CAST(value AS TEXT), '$.createdAt') AS created_at,",
-        "json_extract(CAST(value AS TEXT), '$.tokenCount') AS token_count FROM cursorDiskKV",
+        "json_extract(CAST(value AS TEXT), '$.tokenCount') AS token_count,",
+        "json_extract(CAST(value AS TEXT), '$.type') AS bubble_type,",
+        "substr(json_extract(CAST(value AS TEXT), '$.text'), 1, 2000) AS bubble_text FROM cursorDiskKV",
         `WHERE key >= ${sqlLiteral(startKey)} AND key < ${sqlLiteral(endKey)}`,
         "ORDER BY key;",
       ].join(" ");
@@ -1369,6 +1575,7 @@ function collectActualCursorMetrics(context: ExtractorContext): ActualCollectorR
         timestampMs: bubbles.timestampMs,
         ...(usage.total > 0 ? { tokenUsage: usage } : {}),
         ...(bubbles.tokenEvents.length > 0 ? { tokenEvents: bubbles.tokenEvents } : {}),
+        measurement: isMeasurementPrompt(bubbles.firstUserText),
       });
     }
   }
@@ -1411,15 +1618,23 @@ function queryCursorBubbleMetrics(
   dbUri: string,
   sql: string,
   warnings: string[],
-): { timestampMs: number[]; tokenEvents: TokenUsageEvent[] } {
+): { timestampMs: number[]; tokenEvents: TokenUsageEvent[]; firstUserText?: string } {
   try {
     const output = execFileSync(sqlitePath, ["-readonly", "-json", dbUri, sql], {
       encoding: "utf8",
       maxBuffer: 20 * 1024 * 1024,
     });
-    const parsed = JSON.parse(output || "[]") as Array<{ created_at?: unknown; token_count?: unknown }>;
+    const parsed = JSON.parse(output || "[]") as Array<{
+      created_at?: unknown;
+      token_count?: unknown;
+      bubble_type?: unknown;
+      bubble_text?: unknown;
+    }>;
     const timestampMs: number[] = [];
     const tokenEvents: TokenUsageEvent[] = [];
+    // Earliest user bubble by timestamp (bubble keys are not time-ordered),
+    // used only for local measurement-session classification.
+    let firstUser: { ms: number; text: string } | undefined;
     for (const row of parsed) {
       const ms = parseTimestampMs(normalizeTimestamp(row.created_at));
       if (ms !== null) {
@@ -1432,8 +1647,14 @@ function queryCursorBubbleMetrics(
           usage: { input: 0, cachedInput: 0, cacheCreationInput: 0, cacheReadInput: 0, output: 0, reasoningOutput: 0, total },
         });
       }
+      const rawType = row.bubble_type;
+      const isUserBubble = rawType === 1 || rawType === "1" || rawType === "user";
+      const text = typeof row.bubble_text === "string" ? row.bubble_text.trim() : "";
+      if (ms !== null && isUserBubble && text && (!firstUser || ms < firstUser.ms)) {
+        firstUser = { ms, text };
+      }
     }
-    return { timestampMs, tokenEvents };
+    return { timestampMs, tokenEvents, ...(firstUser ? { firstUserText: firstUser.text } : {}) };
   } catch {
     warnings.push("cursor_sqlite_query_failed");
     return { timestampMs: [], tokenEvents: [] };
@@ -1482,6 +1703,73 @@ function parseActualJsonlContent(
     tokenUsage = tokenUsageForEntry(parsed, tokenUsage) ?? tokenUsage;
   }
   return { timestampMs, ...(tokenUsage ? { tokenUsage } : {}) };
+}
+
+/**
+ * Lightweight measurement-session scan for the metrics path (which never
+ * builds NormalizedEvents). Mirrors classifyLine + the codex legacy user-role
+ * promotion + the no-human-prompt fallback used by the normalized path so
+ * both paths always agree on classification. Also collects raw provider
+ * model ids (claude assistant `message.model`, codex `turn_context` model)
+ * for the profile_analysis_overhead model_families field. Local-only.
+ */
+function scanJsonlMeasurementSignals(
+  tool: AgentTool,
+  content: string,
+): { measurement: boolean; models: string[] } {
+  const humanPrompts: Array<{ text: string; ms: number }> = [];
+  const userRoleEvents: Array<{ text: string; ms: number }> = [];
+  const models = new Set<string>();
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const parsed = parseMaybeJson(trimmed);
+    if (!parsed || typeof parsed !== "object") {
+      continue;
+    }
+    const record = parsed as Record<string, unknown>;
+    if (tool === "claude" && record.type === "assistant") {
+      const message = record.message;
+      if (message && typeof message === "object") {
+        const model = (message as Record<string, unknown>).model;
+        if (typeof model === "string" && model && model !== "<synthetic>" && models.size < 32) {
+          models.add(model);
+        }
+      }
+    }
+    if (tool === "codex" && record.type === "turn_context") {
+      const payload = record.payload;
+      if (payload && typeof payload === "object") {
+        const model = (payload as Record<string, unknown>).model;
+        if (typeof model === "string" && model && models.size < 32) {
+          models.add(model);
+        }
+      }
+    }
+    const classified = classifyLine(tool, record);
+    if (classified.skip) {
+      continue;
+    }
+    const text = clampText(extractTextParts(parsed).join("\n\n"));
+    if (!text) {
+      continue;
+    }
+    const ms =
+      parseTimestampMs(normalizeTimestamp(getProperty(parsed, ["timestamp", "createdAt", "created_at", "time"]))) ?? 0;
+    if (classified.humanPrompt && !isNonPromptMarkerText(text)) {
+      humanPrompts.push({ text, ms });
+    } else if (classified.role === "user" && !classified.isSubagent) {
+      userRoleEvents.push({ text, ms });
+    }
+  }
+  const pool = humanPrompts.length > 0 ? humanPrompts : userRoleEvents;
+  if (pool.length === 0) {
+    return { measurement: false, models: Array.from(models) };
+  }
+  pool.sort((left, right) => left.ms - right.ms);
+  return { measurement: isMeasurementPrompt(pool[0].text), models: Array.from(models) };
 }
 
 function collectClaudeTokenEvents(content: string): TokenUsageEvent[] {
@@ -1832,9 +2120,10 @@ function createExtractorContext(options: LocalExtractorOptions): ExtractorContex
 
 /**
  * Normalizes a git remote URL into a comparable host/path key. Used only for
- * local session<->project attribution; never serialized into any output.
+ * local session<->project attribution and LOCAL-ONLY shipped-candidate
+ * source keys; never serialized into any submitted profile payload.
  */
-function normalizeRemoteUrl(url: string): string | null {
+export function normalizeRemoteUrl(url: string): string | null {
   const trimmed = url.trim().toLowerCase();
   if (!trimmed) {
     return null;
@@ -1933,6 +2222,19 @@ function collectClaudeSessions(context: ExtractorContext): CollectorResult {
       return true;
     })
     .slice(0, context.maxSessions);
+  // Subagent sessions inherit the parent transcript's measurement
+  // classification (their own first prompt is the parent's delegation text).
+  const measurementByMainKey = new Map<string, boolean>();
+  for (const session of sessions) {
+    if (!session.subagentOf) {
+      measurementByMainKey.set(session.sessionKey, session.measurementSession === true);
+    }
+  }
+  for (const session of sessions) {
+    if (session.subagentOf && measurementByMainKey.has(session.subagentOf)) {
+      session.measurementSession = measurementByMainKey.get(session.subagentOf);
+    }
+  }
   if (files.length === 0) {
     warnings.push("claude_no_project_matching_sessions");
   }
@@ -2092,14 +2394,18 @@ function collectCursorSessions(context: ExtractorContext): CollectorResult {
   }
 
   const sessions = Array.from(sessionsByKey.entries())
-    .map(([sessionKey, events]) => ({
-      tool: "cursor" as const,
-      sessionKey,
-      sessionRef: opaqueRef(context.salt, "cursor-session", sessionKey),
-      events: sortEvents(events).slice(0, MAX_EVENTS_PER_SESSION),
-      droppedReasons: {},
-      signals: signalsByKey.get(sessionKey) ?? emptySessionSignals(),
-    }))
+    .map(([sessionKey, events]) => {
+      const sortedEvents = sortEvents(events).slice(0, MAX_EVENTS_PER_SESSION);
+      return {
+        tool: "cursor" as const,
+        sessionKey,
+        sessionRef: opaqueRef(context.salt, "cursor-session", sessionKey),
+        events: sortedEvents,
+        droppedReasons: {},
+        signals: signalsByKey.get(sessionKey) ?? emptySessionSignals(),
+        measurementSession: isMeasurementPrompt(measurementClassificationText(sortedEvents)),
+      };
+    })
     .filter((session) => session.events.length > 0)
     .slice(0, context.maxSessions);
   if (sessions.length === 0) {
@@ -2249,6 +2555,7 @@ function parseJsonlSession(context: ExtractorContext, tool: AgentTool, filePath:
     droppedReasons,
     scopeMatched,
     signals,
+    measurementSession: isMeasurementPrompt(measurementClassificationText(events)),
     ...(sessionCwd ? { cwd: sessionCwd } : {}),
     ...(sessionRemoteKey ? { remoteKey: sessionRemoteKey } : {}),
   };

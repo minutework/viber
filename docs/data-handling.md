@@ -1,6 +1,6 @@
 # Data handling — exactly what leaves your machine
 
-**Contract version:** schema `1.2.0` / rubric `1.1.0` / repo_rubric `1.0.0` (decoupled; accepted
+**Contract version:** schema `1.3.0` / rubric `1.1.0` / repo_rubric `1.0.0` (decoupled; accepted
 pairings are enforced by public-dj's server-side compatibility map).
 
 viber analyzes your coding-agent transcripts **locally, inside your own agent, on your own
@@ -16,7 +16,8 @@ and diff the exact payload with `--dry-run` before anything is sent.
 
 The bundled MCP server also provides local-only analysis helpers: `discover_local_sources()`,
 `build_actual_metrics()`, `build_episode_candidates()`, `build_wrapped_aggregates()`,
-`git_aggregate_metrics()`, and `analyze_repo_architecture()` — all local-only; they read
+`git_aggregate_metrics()`, `analyze_repo_architecture()`, and `get_shipped_with_ai()` — all
+local-only; they read
 transcript stores, host-side git metadata, and (for explicitly selected repos) repository
 structure, and send nothing over the network. Cursor extraction uses `sqlite3` against Cursor's
 `state.vscdb` in read-only immutable mode and only counts project-scoped rows.
@@ -50,6 +51,8 @@ client telemetry.
 | Client telemetry | OS **family**, durations, pattern-bounded versions | `darwin`/`linux`/`windows` only. |
 | Redaction report | two `applied: true` flags + counts | Advisory; public-dj re-verifies independently and unconditionally. |
 | Repo architecture scorecards (opt-in) | per-repo numbers/booleans/enums + salted hex `repo_ref` + ≤2 paraphrased ≤400-char notes | Only for repos you explicitly selected (`--repo`/`--repos`/interactive picker). Repos identified by primary language + size band, never name/path. The secret scan ships a COUNT only. Self-reported; server re-verification is a later slice. |
+| `shipped_with_ai` (opt-in outcome layer) | mode enum + aggregate summary counts; with explicit approval: ≤20 items, each a ≤120-char title, optional `https://` URL, category/contribution/evidence enums, `YYYY-MM` month | **Named items leave the machine ONLY after you approve them in the `viber-mcp --review-shipped` CLI review.** Titles and URLs are the SOLE allowlisted name-bearing fields in the whole profile; both are still secret-scanned, URLs are https-only (no userinfo, no IP/localhost hosts). Without approval, at most aggregate counts ship (`aggregate_only`); opt-out ships nothing. Raw detection candidates (repo names, paths, hashes, remotes) never ship. |
+| `vibe_metrics.profile_analysis_overhead` | aggregate counts only: sessions, agent-hours, provider tokens, per-tool counts, model-family list, timestamp | Audit trail for Vibexp's OWN analysis runs (measurement sessions). These runs are **excluded from every builder stat** and surface only here, as aggregate-only counts. |
 
 ## What NEVER leaves your machine
 
@@ -183,7 +186,41 @@ separate from — and changes nothing about — the single-project session priva
   is unchanged.
 
 The verbatim-quote insights (cryptic prompt, crash-out quote, go-to phrase) remain EXCLUDED: only
-their numeric counts ship. Any future verbatim tier requires a future schema (1.3.0 or later)
-consent object, per-quote approval, and an explicit amendment to this document — the 1.2.0
-repo-architecture block does not consume that reservation and adds no verbatim transcript or
-source content.
+their numeric counts ship. Any future verbatim tier requires a future schema consent object,
+per-quote approval, and an explicit amendment to this document — neither the 1.2.0
+repo-architecture block nor the 1.3.0 outcome layer consumes that reservation; neither adds any
+verbatim transcript or source content (1.3.0 item titles are user-typed/approved public product
+names, not transcript quotes).
+
+## Schema 1.3.0 additions (shipped-with-AI outcome layer + analysis-overhead audit)
+
+Schema 1.3.0 adds two OPTIONAL blocks. Neither changes the transcript/source privacy contract
+above; both are enforced fail-closed on the client and re-scrubbed/recomputed by public-dj.
+
+### `shipped_with_ai` — named outcomes ship ONLY after explicit CLI approval
+
+- Detection (`viber-mcp --detect-shipped`) is **local and read-only**: it inspects the selected
+  project + your explicitly selected `VIBER_ARCH_REPOS` for release/deploy/docs/PR signals and
+  prints candidates to YOUR terminal. **Raw candidates — repo names, labels, paths, source keys —
+  never ship** and have no schema field.
+- **Named items leave the machine only after the interactive `viber-mcp --review-shipped` review**
+  (driven over `/dev/tty`, so a piped run cannot fake approvals). Approvals persist locally at
+  `~/.vibexp/shipped/approved.json` (`0600`); the agent-side `get_shipped_with_ai()` tool returns
+  the approved block verbatim or `null` — the agent may never invent or edit items.
+- The item **title** and optional **public URL** are the sole allowlisted name-bearing fields in
+  the entire profile. Both still pass the secret-scrubber layer; the title additionally passes the
+  path/identifier layer with only the product-name categories (relative path / filename / dotted
+  identifier) waived so names like "vibexp-next" can pass — absolute/home/Windows paths, emails,
+  and code still reject. URLs must be `https://`, ≤300 chars, with no userinfo and no
+  IP/localhost/internal hosts. public-dj re-runs the same split on ingestion.
+- Without item approval, at most **aggregate counts** ship (`mode: "aggregate_only"`: totals by
+  category and evidence tier). Opting out ships nothing at all.
+
+### `vibe_metrics.profile_analysis_overhead` — Vibexp's own runs, counted apart
+
+Vibexp's own profile-analysis runs (the sessions started by `upload.sh`, including scheduled
+refreshes) are classified as **measurement sessions** at extraction time and **excluded from every
+builder stat** — session counts, agent-hours, calendar activity, token totals, episode candidates,
+and all wrapped aggregates — so the tool never inflates the profile it measures. They are reported
+only as this aggregate-only audit block: sessions, agent-hours, provider tokens, per-tool counts,
+allowlisted model families, and a timestamp. No transcript text, prompts, paths, or identifiers.

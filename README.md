@@ -53,8 +53,22 @@ written to `~/.vibexp/refresh/credential` only if you opt into the living-profil
 | `upload.sh` | The download-then-exec bootstrap (detect agent, authorize, run, submit). |
 | [`docs/data-handling.md`](docs/data-handling.md) | Exactly what does and does not leave your machine. |
 
-**Contract:** schema `1.2.0` / rubric `1.1.0` / repo_rubric `1.0.0` (decoupled since 1.1.0;
+**Contract:** schema `1.3.0` / rubric `1.1.0` / repo_rubric `1.0.0` (decoupled since 1.1.0;
 public-dj dual-accepts older verified snapshots through its server-side compatibility map).
+
+## Outcome layer — shipped with AI
+
+Schema 1.3.0 adds an opt-in `shipped_with_ai` block: the things you actually shipped with AI
+(apps, features, OSS, docs), as **user-approved public facts**. Detection is local and read-only;
+**named items leave your machine only after you approve them in an interactive CLI review**
+(`viber-mcp --detect-shipped` prints candidates to your terminal; `viber-mcp --review-shipped`
+runs the approve/hide review and persists `~/.vibexp/shipped/approved.json`). The bootstrap offers
+the review on interactive runs (skip with `VIBER_SHIPPED_NO_PROMPT=1`); scheduled/non-interactive
+runs never prompt and just reuse stored approvals. Approved titles/URLs are the only name-bearing
+fields in the profile — still secret-scanned, URLs https-only; without approval at most aggregate
+counts ship. Vibexp's own analysis runs are excluded from all builder stats and reported only as
+the aggregate `vibe_metrics.profile_analysis_overhead` audit block. Details in
+[`docs/data-handling.md`](docs/data-handling.md).
 
 ## Status
 

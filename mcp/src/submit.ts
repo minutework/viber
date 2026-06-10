@@ -13,7 +13,7 @@
  * The token is the bearer of the verified GitHub handle; the body's `handle`
  * field is overwritten/validated against the token by public-dj on ingestion.
  */
-import { detectViolations } from "./redaction.js";
+import { detectShippedTitleViolations, detectShippedUrlViolations, detectViolations } from "./redaction.js";
 import { validateProfileAgainstSchema } from "./schema.js";
 
 /** Free-text fields in the profile that must pass the redaction backstop. */
@@ -80,11 +80,51 @@ const STRUCTURED_FIELD_SEGMENTS = new Set<string>([
   "outcome",
   "overall_grade",
   "os_family",
+  // shipped_with_ai (schema 1.3.0): enums/dates only — items[*].title and
+  // items[*].public_url are intentionally NOT here; they go through the
+  // dedicated carve-out scans below.
+  "mode",
+  "category",
+  "shipped_on",
+  "ai_contribution",
+  "evidence_status",
+  "last_detected_at",
+  // profile_analysis_overhead (schema 1.3.0): allowlist-normalized model
+  // families plus a timestamp; the numerics are not strings and never reach
+  // the text walk.
+  "model_families",
+  "last_analysis_at",
 ]);
 
 function isStructuredPointer(pointer: string): boolean {
   const segments = pointer.split("/").filter(Boolean);
   return segments.some((segment) => STRUCTURED_FIELD_SEGMENTS.has(segment));
+}
+
+/**
+ * shipped_with_ai.items[*].title / .public_url are the two approved public
+ * free-name fields (schema 1.3.0). They do NOT go through the full prose
+ * redactor: per the shared contract they get the secrets layer plus a reduced
+ * reject set (title) or a dedicated https-URL validator (public_url) so
+ * explicitly user-approved product/repo names can ship. The same split is
+ * re-enforced server-side by public-dj.
+ */
+function shippedItemFieldKind(pointer: string): "title" | "public_url" | null {
+  const segments = pointer.split("/").filter(Boolean);
+  if (
+    segments.length === 4 &&
+    segments[0] === "shipped_with_ai" &&
+    segments[1] === "items" &&
+    /^\d+$/.test(segments[2])
+  ) {
+    if (segments[3] === "title") {
+      return "title";
+    }
+    if (segments[3] === "public_url") {
+      return "public_url";
+    }
+  }
+  return null;
 }
 
 export interface RedactionScan {
@@ -97,6 +137,15 @@ export function scanProfileForLeaks(profile: unknown): RedactionScan {
   collectTextFields(profile, fields);
   const violations: Array<{ pointer: string; layers: string[] }> = [];
   for (const field of fields) {
+    const shippedKind = shippedItemFieldKind(field.pointer);
+    if (shippedKind !== null) {
+      const layers =
+        shippedKind === "title" ? detectShippedTitleViolations(field.text) : detectShippedUrlViolations(field.text);
+      if (layers.length > 0) {
+        violations.push({ pointer: field.pointer, layers });
+      }
+      continue;
+    }
     if (isStructuredPointer(field.pointer)) {
       continue;
     }

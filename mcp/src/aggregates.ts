@@ -115,8 +115,14 @@ export function buildWrappedAggregates(options: LocalExtractorOptions = {}): Wra
   const git = collectGitCommitStats(options);
   const warnings = [...new Set([...normalized.warnings, ...actual.warnings, ...git.warnings])];
 
-  const mainSessions = normalized.sessions.filter((session) => !session.subagentOf);
-  const subagentSessions = normalized.sessions.filter((session) => session.subagentOf);
+  // Vibexp measurement (profile-analysis) sessions are excluded from every
+  // wrapped aggregate — model usage, prompt/plan/interruption stats, work
+  // streams, craft/economics/orchestration/identity blocks. They surface only
+  // in vibe_metrics.profile_analysis_overhead (built in extractors.ts).
+  // collectActualSessionData already drops them from the `actual` set.
+  const visibleSessions = normalized.sessions.filter((session) => session.measurementSession !== true);
+  const mainSessions = visibleSessions.filter((session) => !session.subagentOf);
+  const subagentSessions = visibleSessions.filter((session) => session.subagentOf);
   const humanPrompts = mainSessions.flatMap((session) => session.events.filter((event) => event.humanPrompt));
 
   return {
@@ -126,7 +132,7 @@ export function buildWrappedAggregates(options: LocalExtractorOptions = {}): Wra
       ...buildModelUsage(mainSessions),
       ...buildPlanMode(mainSessions),
       ...buildInterruption(mainSessions, humanPrompts.length),
-      ...buildConcurrency(actual.sessions, normalized.sessions),
+      ...buildConcurrency(actual.sessions, visibleSessions),
       ...buildPromptStats(mainSessions, humanPrompts, nowMs),
       ...buildEventHourHistogram(actual.sessions),
       ...buildLongestRun(mainSessions),
@@ -135,7 +141,7 @@ export function buildWrappedAggregates(options: LocalExtractorOptions = {}): Wra
     work_streams: buildWorkStreams(mainSessions),
     craft_stats: buildCraftStats(mainSessions, git),
     economics_stats: buildEconomicsStats(mainSessions, actual.sessions, git),
-    orchestration_stats: buildOrchestrationStats(normalized.sessions, actual.sessions),
+    orchestration_stats: buildOrchestrationStats(visibleSessions, actual.sessions),
     identity_stats: buildIdentityStats(actual.sessions, git, nowMs),
     warnings,
   };

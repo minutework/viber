@@ -8,6 +8,8 @@
  */
 import { readFileSync } from "node:fs";
 
+import { approvalsFilePath } from "./shipped.js";
+
 const DEFAULT_PUBLIC_DJ_BASE_URL = "https://profile.vibexp.com";
 const INGEST_PATH = "/api/v1/builder-profiles/ingest/";
 const SCORE_PATH = "/api/v1/builder-profiles/score/";
@@ -27,6 +29,10 @@ export interface ViberMcpConfig {
   cacheDir: string;
   submitResultFile: string;
   progressFile: string;
+  /** $VIBER_HOME/shipped/approved.json (VIBER_HOME defaults to ~/.vibexp). */
+  shippedApprovalsFile: string;
+  /** Extra repos for --detect-shipped/--review-shipped (colon-separated absolute paths). */
+  archRepoPaths: string[];
 }
 
 export function resolveConfig(env: NodeJS.ProcessEnv, argDryRun: boolean): ViberMcpConfig {
@@ -43,6 +49,11 @@ export function resolveConfig(env: NodeJS.ProcessEnv, argDryRun: boolean): Viber
   const cacheDir = env.VIBER_CACHE_DIR ?? "";
   const submitResultFile = env.VIBER_SUBMIT_RESULT_FILE ?? "";
   const progressFile = env.VIBER_PROGRESS_FILE ?? "";
+  const shippedApprovalsFile = approvalsFilePath(env);
+  const archRepoPaths = (env.VIBER_ARCH_REPOS ?? "")
+    .split(":")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
   return {
     ingestUrl,
     scoreUrl,
@@ -56,6 +67,8 @@ export function resolveConfig(env: NodeJS.ProcessEnv, argDryRun: boolean): Viber
     cacheDir,
     submitResultFile,
     progressFile,
+    shippedApprovalsFile,
+    archRepoPaths,
   };
 }
 

@@ -95,7 +95,9 @@ Environment overrides:
   VIBER_OAUTH_START_URL, VIBER_TOKEN_EXCHANGE_URL,
   VIBER_SCORE_HEALTH_URL, VIBER_METRICS_REFRESH_URL,
   VIBER_SKILL_URL, VIBER_MCP_PACKAGE, VIBER_LOOPBACK_PORT,
-  VIBER_CURSOR_MODEL, VIBER_ARCH_REPOS
+  VIBER_CURSOR_MODEL, VIBER_ARCH_REPOS,
+  VIBER_SHIPPED_NO_PROMPT (=1 skips the interactive shipped-with-AI review;
+  stored approvals under ~/.vibexp/shipped/approved.json are still reused)
 USAGE
 }
 
@@ -795,6 +797,37 @@ warn() { printf '\033[1;33m[vibexp]\033[0m %s\n' "$*" >&2; }
 err() { printf '\033[1;31m[vibexp]\033[0m %s\n' "$*" >&2; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# --------------------------------------------------------------------------- #
+# Shipped-with-AI review — the local CLI approval gate for the outcome layer
+# --------------------------------------------------------------------------- #
+# Named shipped items can leave the machine ONLY after this explicit review:
+# `viber-mcp --review-shipped` runs local read-only detection, drives its own
+# /dev/tty approve/hide UX, and persists ~/.vibexp/shipped/approved.json
+# (0600). Non-interactive and scheduled runs NEVER prompt — at analysis time
+# the agent's get_shipped_with_ai tool simply reuses whatever was previously
+# approved (or returns null and the profile omits the block). Skip with
+# VIBER_SHIPPED_NO_PROMPT=1. A review failure never blocks the run.
+maybe_review_shipped() {
+  [ "$NON_INTERACTIVE" -eq 1 ] && return 0
+  [ "$SCHEDULE_ONLY" -eq 1 ] && return 0
+  [ "$METRICS_REFRESH" -eq 1 ] && return 0
+  [ "${VIBER_SHIPPED_NO_PROMPT:-0}" = "1" ] && return 0
+  if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+    return 0
+  fi
+  if ! have npx; then
+    warn "npx not found; skipping the shipped-with-AI review (previously stored approvals, if any, are reused)."
+    return 0
+  fi
+  log "Shipped-with-AI review (local-only detection; nothing leaves this machine)."
+  if ! VIBER_SELECTED_PROJECT_PATH="$SELECTED_PROJECT_PATH" \
+    npx -y "$VIBER_MCP_PACKAGE" viber-mcp --review-shipped; then
+    warn "Shipped-with-AI review did not complete; continuing (previously stored approvals, if any, are reused)."
+  fi
+}
+
+maybe_review_shipped
 
 elapsed_label() {
   total="${1:-0}"
@@ -1759,6 +1792,7 @@ fi
 if [ -n "${VIBER_ARCH_REPOS:-}" ]; then
   PROMPT="${PROMPT} The user explicitly selected these repositories for local structural scans (colon-separated; also exported as VIBER_ARCH_REPOS): ${VIBER_ARCH_REPOS}. Follow SKILL.md section 7: scan each with the viber-mcp analyze_repo_architecture tool, judge dimensions 8-9 locally per skill/repo_rubric.md, and attach repo_architecture scorecards when ready. A failed scan must not block submission."
 fi
+PROMPT="${PROMPT} Call the viber-mcp get_shipped_with_ai tool exactly once: if it returns a non-null shipped_with_ai block, include that block VERBATIM as profile.shipped_with_ai; if it returns null, omit shipped_with_ai entirely. Never invent, add, retitle, reorder, or edit shipped items — only the user's CLI-approved data ships."
 
 # MCP server launch command (stdio). Agents that accept inline MCP config use this.
 MCP_CMD="npx -y ${VIBER_MCP_PACKAGE} viber-mcp"
@@ -1804,7 +1838,7 @@ JSON
   run_with_heartbeat "Claude profile generation" \
     claude -p "$PROMPT" \
     --permission-mode auto \
-    --allowedTools "Read,Glob,Grep,LS,Bash,mcp__viber__analysis_manifest,mcp__viber__discover_local_sources,mcp__viber__build_actual_metrics,mcp__viber__build_episode_candidates,mcp__viber__git_aggregate_metrics,mcp__viber__score_episodes,mcp__viber__submit_profile,mcp__viber__build_wrapped_aggregates,mcp__viber__analyze_repo_architecture" \
+    --allowedTools "Read,Glob,Grep,LS,Bash,mcp__viber__analysis_manifest,mcp__viber__discover_local_sources,mcp__viber__build_actual_metrics,mcp__viber__build_episode_candidates,mcp__viber__git_aggregate_metrics,mcp__viber__score_episodes,mcp__viber__submit_profile,mcp__viber__build_wrapped_aggregates,mcp__viber__analyze_repo_architecture,mcp__viber__get_shipped_with_ai" \
     --disallowedTools "Agent,Edit,Write,MultiEdit,NotebookEdit" \
     --mcp-config "$MCP_CFG" \
     --strict-mcp-config \
@@ -1859,6 +1893,7 @@ run_codex() {
     build_episode_candidates \
     git_aggregate_metrics \
     analyze_repo_architecture \
+    get_shipped_with_ai \
     score_episodes \
     submit_profile
   do

@@ -6,7 +6,7 @@
 export function makeValidProfile(): Record<string, unknown> {
   const episodeId = "a1b2c3d4e5f60718";
   return {
-    schema_version: "1.2.0",
+    schema_version: "1.3.0",
     rubric_version: "1.0.0",
     handle: "octocat",
     generated_at: "2026-06-07T12:00:00Z",
@@ -245,8 +245,8 @@ export function makeRepoArchitecture(): Record<string, unknown> {
 }
 
 /**
- * The happy-path 1.2.0 profile: the base fixture plus the optional
- * repo_architecture block and the advisory blended headline.
+ * The happy-path repo-architecture profile: the base fixture plus the
+ * optional repo_architecture block and the advisory blended headline.
  * combined_score 72 == round(0.65 * 68 + 0.35 * 80) — self-consistent with
  * the base fixture's overall_score of 68.
  */
@@ -256,5 +256,58 @@ export function makeValidProfileWithRepoArchitecture(): Record<string, unknown> 
     repo_architecture: makeRepoArchitecture(),
     combined_score: 72,
     combined_grade: "proficient",
+  };
+}
+
+/**
+ * A schema-valid 1.3.0 `shipped_with_ai` block in approved_items mode: two
+ * items with mixed categories/evidence, one carrying a public https URL. The
+ * summary is self-consistent with the items (server recomputes it anyway).
+ */
+export function makeShippedWithAi(): Record<string, unknown> {
+  return {
+    mode: "approved_items",
+    summary: {
+      total: 2,
+      by_category: { feature: 1, oss: 1 },
+      by_evidence: { release_tag: 1, public_url: 1 },
+    },
+    items: [
+      {
+        title: "vibexp-next builder profiles",
+        category: "feature",
+        shipped_on: "2026-05",
+        ai_contribution: "majority_ai",
+        evidence_status: "release_tag",
+      },
+      {
+        title: "minutework.ai console",
+        public_url: "https://github.com/acme/console",
+        category: "oss",
+        shipped_on: "2026-04",
+        ai_contribution: "ai_led",
+        evidence_status: "public_url",
+      },
+    ],
+    last_detected_at: "2026-06-07T12:00:00Z",
+  };
+}
+
+/**
+ * A schema-valid 1.3.0 `vibe_metrics.profile_analysis_overhead` block:
+ * aggregate-only audit of the measurement sessions excluded from every
+ * normal metric.
+ */
+export function makeProfileAnalysisOverhead(): Record<string, unknown> {
+  return {
+    sessions: 3,
+    vibe_agent_hours: 1.4,
+    provider_tokens: 250000,
+    by_tool: {
+      claude: { sessions: 2, vibe_agent_hours: 1.1, provider_tokens: 200000 },
+      codex: { sessions: 1, vibe_agent_hours: 0.3, provider_tokens: 50000 },
+    },
+    model_families: ["GPT-5.5", "Opus 4.8"],
+    last_analysis_at: "2026-06-07T11:30:00Z",
   };
 }
