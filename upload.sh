@@ -55,6 +55,11 @@ VIBER_LOOPBACK_PORT="${VIBER_LOOPBACK_PORT:-0}"
 # --------------------------------------------------------------------------- #
 AGENT=""
 DRY_RUN=0
+SCHEDULE=0
+SCHEDULE_ONLY=0
+SCHEDULE_UNINSTALL=0
+NO_SCHEDULE=0
+NON_INTERACTIVE=0
 
 print_usage() {
   cat <<'USAGE'
@@ -63,6 +68,11 @@ viber bootstrap
 Options:
   --agent <claude|codex|cursor>  Force a specific agent (else auto-pick a logged-in one).
   --dry-run                      Agent prints the exact payload and sends NOTHING.
+  --schedule                     After this run, install the daily living-profile refresh.
+  --schedule-only                Install the daily refresh and exit (no analysis now).
+  --schedule-uninstall           Remove the daily refresh and exit.
+  --no-schedule                  Never offer to install the daily refresh.
+  --non-interactive              Scheduled/unattended mode: no prompts, no browser.
   -h, --help                     Show this help.
 
 Environment overrides:
@@ -86,6 +96,27 @@ while [ "$#" -gt 0 ]; do
       DRY_RUN=1
       shift
       ;;
+    --schedule)
+      SCHEDULE=1
+      shift
+      ;;
+    --schedule-only)
+      SCHEDULE_ONLY=1
+      shift
+      ;;
+    --schedule-uninstall)
+      SCHEDULE_UNINSTALL=1
+      shift
+      ;;
+    --no-schedule)
+      NO_SCHEDULE=1
+      shift
+      ;;
+    --non-interactive)
+      NON_INTERACTIVE=1
+      NO_SCHEDULE=1
+      shift
+      ;;
     -h | --help)
       print_usage
       exit 0
@@ -97,6 +128,326 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+# --------------------------------------------------------------------------- #
+# Living profile — self-installing daily refresh (works from `curl | bash`)
+# --------------------------------------------------------------------------- #
+# The runner below is EMBEDDED in this bootstrap and written to
+# ~/.viber/bin/viber-refresh at install time, so a developer who only ever ran
+# `curl -fsSL https://viber.minutework.ai/upload.sh | bash` gets the schedule
+# with no repo checkout. Each night the runner re-fetches upload.sh from
+# VIBER_BASE_URL (the same trust model as the install command), falling back
+# to the last cached copy when offline.
+#
+# Catch-up semantics: fires at 00:15 LOCAL time; macOS launchd coalesces
+# firings missed while asleep, and a RunAtLoad/login firing covers machines
+# powered off at midnight — the runner's local-date stamp makes catch-ups
+# at-most-once-per-day. Linux uses a systemd user timer with Persistent=true.
+#
+# Publishing: unattended runs need a non-interactive token. The runner tries,
+# in order: VIBER_TOKEN_COMMAND (advanced), then a stored refresh credential
+# at ~/.viber/refresh/credential exchanged at VIBER_TOKEN_REFRESH_URL (issued
+# by the platform once the refresh-credential endpoint ships). With neither,
+# nightly runs are PREPARE-ONLY (full analysis, caches warmed, payload
+# validated, nothing sent) and a notification says so.
+
+VIBER_HOME_DIR="${VIBER_HOME:-$HOME/.viber}"
+SCHEDULE_LABEL="ai.minutework.viber.refresh"
+
+vlog() { printf 'viber: %s\n' "$*" >&2; }
+vwarn() { printf 'viber: WARNING: %s\n' "$*" >&2; }
+
+write_refresh_runner() {
+  mkdir -p "$VIBER_HOME_DIR/bin" "$VIBER_HOME_DIR/refresh" "$VIBER_HOME_DIR/logs"
+  chmod 700 "$VIBER_HOME_DIR" "$VIBER_HOME_DIR/refresh" 2>/dev/null || true
+  cat >"$VIBER_HOME_DIR/bin/viber-refresh" <<'REFRESH_EOF'
+#!/bin/bash
+set -euo pipefail
+# viber-refresh — daily living-profile runner (written by upload.sh; do not
+# edit in place: re-run the bootstrap with --schedule-only to regenerate).
+VIBER_HOME="${VIBER_HOME:-$HOME/.viber}"
+REFRESH_DIR="$VIBER_HOME/refresh"
+CONFIG_FILE="$REFRESH_DIR/config"
+STAMP_FILE="$REFRESH_DIR/last-success-date"
+LOCK_DIR="$REFRESH_DIR/lock"
+LOG_FILE="$VIBER_HOME/logs/refresh.log"
+mkdir -p "$REFRESH_DIR" "$VIBER_HOME/logs"
+
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE"; }
+notify() {
+  command -v osascript >/dev/null 2>&1 &&
+    osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1 || true
+  command -v notify-send >/dev/null 2>&1 && notify-send "$1" "$2" >/dev/null 2>&1 || true
+}
+
+FORCE=0
+for arg in "${@:-}"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    --status)
+      echo "stamp:  $(cat "$STAMP_FILE" 2>/dev/null || echo never)"
+      echo "config: $CONFIG_FILE $([ -f "$CONFIG_FILE" ] && echo present || echo MISSING)"
+      echo "log:    $LOG_FILE"
+      exit 0
+      ;;
+    "") ;;
+    *) echo "viber-refresh: unknown flag '$arg' (--force|--status)" >&2; exit 2 ;;
+  esac
+done
+
+# shellcheck disable=SC1090
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+[ "${VIBER_REFRESH_DISABLED:-0}" = "1" ] && { vlog "skipped: disabled"; exit 0; }
+
+TODAY="$(date +%F)" # LOCAL date — the user's own midnight.
+if [ "$FORCE" -eq 0 ] && [ "$(cat "$STAMP_FILE" 2>/dev/null || true)" = "$TODAY" ]; then
+  exit 0 # already refreshed today; catch-up firings are silent no-ops
+fi
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  if [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +360 2>/dev/null)" ]; then
+    rm -rf "$LOCK_DIR" && mkdir "$LOCK_DIR"
+  else
+    vlog "skipped: another refresh is running"
+    exit 0
+  fi
+fi
+trap 'rm -rf "$LOCK_DIR"' EXIT
+
+[ -f "$LOG_FILE" ] && [ "$(wc -c <"$LOG_FILE")" -gt 1048576 ] && mv "$LOG_FILE" "$LOG_FILE.1"
+
+PROJECT_PATH="${VIBER_REFRESH_PROJECT_PATH:-}"
+if [ -z "$PROJECT_PATH" ] || [ ! -d "$PROJECT_PATH" ]; then
+  vlog "ERROR: VIBER_REFRESH_PROJECT_PATH missing (edit $CONFIG_FILE)"
+  notify "viber" "Daily refresh is not configured — edit ~/.viber/refresh/config"
+  exit 1
+fi
+
+# --- non-interactive submission token -------------------------------------- #
+TOKEN=""
+if [ -n "${VIBER_TOKEN_COMMAND:-}" ]; then
+  TOKEN="$(sh -c "$VIBER_TOKEN_COMMAND" 2>/dev/null | tail -1 | tr -d '[:space:]')" || TOKEN=""
+elif [ -s "$REFRESH_DIR/credential" ] && [ -n "${VIBER_TOKEN_REFRESH_URL:-}" ] && command -v python3 >/dev/null 2>&1; then
+  TOKEN="$(CREDENTIAL_FILE="$REFRESH_DIR/credential" REFRESH_URL="$VIBER_TOKEN_REFRESH_URL" python3 - <<'PY' 2>/dev/null || true
+import json, os, urllib.request
+with open(os.environ["CREDENTIAL_FILE"], encoding="utf-8") as fh:
+    credential = fh.read().strip()
+request = urllib.request.Request(
+    os.environ["REFRESH_URL"],
+    data=json.dumps({"refresh_credential": credential}).encode("utf-8"),
+    headers={"Content-Type": "application/json", "Accept": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=30) as response:
+    body = json.load(response)
+print(str(body.get("submission_token") or "").strip())
+PY
+)"
+fi
+
+# --- the bootstrap to run --------------------------------------------------- #
+SRC=""
+if [ -n "${VIBER_UPLOAD_LOCAL:-}" ] && [ -f "$VIBER_UPLOAD_LOCAL" ]; then
+  SRC="$VIBER_UPLOAD_LOCAL"
+else
+  CACHED="$REFRESH_DIR/upload.cached.sh"
+  BASE="${VIBER_BASE_URL:-https://viber.minutework.ai}"
+  if curl -fsSL "${BASE%/}/upload.sh" -o "$CACHED.tmp" 2>>"$LOG_FILE"; then
+    mv "$CACHED.tmp" "$CACHED"
+  fi
+  if [ ! -s "$CACHED" ]; then
+    vlog "ERROR: could not fetch upload.sh and no cached copy exists"
+    notify "viber" "Daily refresh failed: bootstrap unreachable and no cached copy."
+    exit 1
+  fi
+  SRC="$CACHED"
+fi
+
+ARGS=(--non-interactive)
+[ -n "${VIBER_AGENT:-}" ] && ARGS+=(--agent "$VIBER_AGENT")
+MODE="live"
+if [ -n "$TOKEN" ]; then
+  export VIBER_SUBMIT_TOKEN="$TOKEN"
+else
+  ARGS+=(--dry-run)
+  MODE="prepare-only"
+fi
+
+vlog "starting refresh (mode=$MODE, project=$PROJECT_PATH, src=$SRC)"
+START_TS=$(date +%s)
+if [ -n "${VIBER_REFRESH_SIMULATE:-}" ]; then
+  vlog "simulated run"
+  RESULT=0
+else
+  set +e
+  (cd "$PROJECT_PATH" && bash "$SRC" "${ARGS[@]}") >>"$LOG_FILE" 2>&1
+  RESULT=$?
+  set -e
+fi
+ELAPSED=$(($(date +%s) - START_TS))
+
+if [ "$RESULT" -eq 0 ]; then
+  printf '%s' "$TODAY" >"$STAMP_FILE"
+  vlog "refresh succeeded in ${ELAPSED}s (mode=$MODE)"
+  if [ "$MODE" = "live" ]; then
+    notify "viber" "Builder profile refreshed — your live profile is up to date."
+  else
+    notify "viber" "Profile analysis refreshed (prepare-only). Re-run the viber bootstrap to publish."
+  fi
+else
+  vlog "refresh FAILED in ${ELAPSED}s (exit $RESULT, mode=$MODE) — will retry at the next firing"
+  notify "viber" "Daily profile refresh failed — see ~/.viber/logs/refresh.log"
+  exit "$RESULT"
+fi
+REFRESH_EOF
+  chmod 700 "$VIBER_HOME_DIR/bin/viber-refresh"
+}
+
+write_refresh_config() {
+  local config="$VIBER_HOME_DIR/refresh/config"
+  [ -f "$config" ] && return 0
+  local upload_local=""
+  # When the bootstrap itself is a real file on disk (cloned repo / saved
+  # download), prefer re-running that exact file nightly instead of re-fetching.
+  if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    upload_local="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  fi
+  cat >"$config" <<EOF
+# viber daily-refresh config (sourced by ~/.viber/bin/viber-refresh).
+VIBER_REFRESH_PROJECT_PATH="$PWD"
+VIBER_BASE_URL="$VIBER_BASE_URL"
+VIBER_PUBLIC_DJ_BASE_URL="$VIBER_PUBLIC_DJ_BASE_URL"
+VIBER_PLATFORM_BASE_URL="$VIBER_PLATFORM_BASE_URL"
+VIBER_SKILL_URL="$VIBER_SKILL_URL"
+VIBER_TOKEN_REFRESH_URL="${VIBER_PLATFORM_BASE_URL%/}/api/v1/developer/builder-profile/submission-token/refresh/"
+$([ -n "$AGENT" ] && printf 'VIBER_AGENT="%s"' "$AGENT" || printf '#VIBER_AGENT="claude"')
+$([ -n "$upload_local" ] && printf 'VIBER_UPLOAD_LOCAL="%s"' "$upload_local" || printf '#VIBER_UPLOAD_LOCAL=""')
+# Advanced non-interactive token override (self-hosted operators):
+#VIBER_TOKEN_COMMAND=""
+# Temporary off-switch:
+#VIBER_REFRESH_DISABLED=1
+EOF
+  chmod 600 "$config"
+}
+
+install_schedule() {
+  write_refresh_runner
+  write_refresh_config
+  local runner="$VIBER_HOME_DIR/bin/viber-refresh"
+  case "$(uname -s)" in
+    Darwin)
+      local plist="$HOME/Library/LaunchAgents/$SCHEDULE_LABEL.plist"
+      mkdir -p "$HOME/Library/LaunchAgents"
+      cat >"$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$SCHEDULE_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>$runner</string></array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>15</integer></dict>
+  <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin</string>
+  </dict>
+  <key>StandardOutPath</key><string>$VIBER_HOME_DIR/logs/launchd.log</string>
+  <key>StandardErrorPath</key><string>$VIBER_HOME_DIR/logs/launchd.log</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+</dict>
+</plist>
+EOF
+      launchctl bootout "gui/$(id -u)/$SCHEDULE_LABEL" >/dev/null 2>&1 || true
+      launchctl bootstrap "gui/$(id -u)" "$plist"
+      vlog "Daily refresh installed (00:15 local + catch-up at login/wake)."
+      ;;
+    Linux)
+      if command -v systemctl >/dev/null 2>&1; then
+        local unit_dir="$HOME/.config/systemd/user"
+        mkdir -p "$unit_dir"
+        cat >"$unit_dir/viber-refresh.service" <<EOF
+[Unit]
+Description=viber daily living-profile refresh
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $runner
+EOF
+        cat >"$unit_dir/viber-refresh.timer" <<EOF
+[Unit]
+Description=viber daily living-profile refresh (00:15 local, catch-up)
+[Timer]
+OnCalendar=*-*-* 00:15:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl --user daemon-reload
+        systemctl --user enable --now viber-refresh.timer
+        vlog "Daily refresh installed (systemd user timer, Persistent=true)."
+      else
+        vwarn "No systemd found; add a cron/anacron entry for: bash $runner"
+      fi
+      ;;
+    *)
+      vwarn "Automatic scheduling is not supported on $(uname -s) yet; run manually: bash $runner"
+      ;;
+  esac
+  vlog "Refresh config: $VIBER_HOME_DIR/refresh/config"
+  vlog "Refresh logs:   $VIBER_HOME_DIR/logs/refresh.log"
+}
+
+uninstall_schedule() {
+  case "$(uname -s)" in
+    Darwin)
+      launchctl bootout "gui/$(id -u)/$SCHEDULE_LABEL" >/dev/null 2>&1 || true
+      rm -f "$HOME/Library/LaunchAgents/$SCHEDULE_LABEL.plist"
+      ;;
+    Linux)
+      command -v systemctl >/dev/null 2>&1 && {
+        systemctl --user disable --now viber-refresh.timer >/dev/null 2>&1 || true
+        rm -f "$HOME/.config/systemd/user/viber-refresh.service" "$HOME/.config/systemd/user/viber-refresh.timer"
+        systemctl --user daemon-reload || true
+      }
+      ;;
+  esac
+  vlog "Daily refresh uninstalled (config and logs kept under $VIBER_HOME_DIR)."
+}
+
+maybe_offer_schedule() {
+  [ "$NO_SCHEDULE" -eq 1 ] && return 0
+  if [ "$SCHEDULE" -eq 1 ]; then
+    install_schedule
+    return 0
+  fi
+  # Already installed? Don't nag.
+  [ -f "$HOME/Library/LaunchAgents/$SCHEDULE_LABEL.plist" ] && return 0
+  [ -f "$HOME/.config/systemd/user/viber-refresh.timer" ] && return 0
+  # `curl | bash` leaves stdin on the pipe; prompt via the controlling tty.
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf 'viber: keep this profile LIVE with a daily refresh at 12:15 AM (catch-up if the machine is off)? [Y/n] ' >/dev/tty
+    local answer=""
+    read -r answer </dev/tty || answer="n"
+    case "$answer" in
+      n | N | no | NO) vlog "Skipped daily refresh (re-run with --schedule any time)." ;;
+      *) install_schedule ;;
+    esac
+  else
+    vlog "Tip: install the daily living-profile refresh with: ... | bash -s -- --schedule-only"
+  fi
+}
+
+if [ "$SCHEDULE_UNINSTALL" -eq 1 ]; then
+  uninstall_schedule
+  exit 0
+fi
+if [ "$SCHEDULE_ONLY" -eq 1 ]; then
+  install_schedule
+  exit 0
+fi
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -461,6 +812,10 @@ else
     log "Using submission token from the environment (non-interactive)."
   fi
   if [ -z "$SUBMIT_TOKEN" ]; then
+    if [ "$NON_INTERACTIVE" -eq 1 ]; then
+      err "Non-interactive run has no submission token (set VIBER_SUBMIT_TOKEN, VIBER_TOKEN_COMMAND, or a refresh credential); refusing to open a browser."
+      exit 1
+    fi
     if ! mint_submit_token; then
       err "Could not mint a submission token. You can still preview with --dry-run."
       exit 1
@@ -584,5 +939,7 @@ case "$AGENT" in
   codex) run_codex ;;
   cursor) run_cursor ;;
 esac
+
+maybe_offer_schedule
 
 log "Done. (Token, scratch dir, and any cache are purged on exit — nothing persisted.)"

@@ -72,28 +72,32 @@ npm test               # node --test (redaction + schema + dry-run + submit)
 
 ## Living profile (daily refresh)
 
-A profile should never go stale. `bin/viber-refresh` re-runs the analysis once
-per LOCAL day with anacron-style catch-up, and `scripts/install-schedule.sh`
-wires it into macOS launchd:
+A profile should never go stale. The bootstrap itself installs a daily
+refresh — no repo checkout needed. After a successful run it offers:
+
+    viber: keep this profile LIVE with a daily refresh at 12:15 AM ...? [Y/n]
+
+or do it explicitly from anywhere:
 
 ```sh
-./scripts/install-schedule.sh install --project /path/to/your/project
-./scripts/install-schedule.sh status     # loaded? last run? stamp?
-./scripts/install-schedule.sh uninstall
+curl -fsSL https://viber.minutework.ai/upload.sh | bash -s -- --schedule-only
+curl -fsSL https://viber.minutework.ai/upload.sh | bash -s -- --schedule-uninstall
 ```
 
-Semantics: fires at **00:15 local time**; launchd coalesces firings missed
-while asleep, and a `RunAtLoad` firing at login covers machines that were
-powered off at midnight — a date stamp in `~/.viber/refresh/` makes catch-ups
-at-most-once-per-day. The digest caches keep repeat runs cheap (only new
-sessions cost LLM work).
+What gets installed: a small runner at `~/.viber/bin/viber-refresh` plus a
+macOS LaunchAgent (or a Linux systemd user timer with `Persistent=true`).
+It fires at **00:15 local time**; firings missed while asleep are coalesced
+by the OS, and a login/boot firing covers machines powered off at midnight —
+a local-date stamp makes catch-ups at-most-once-per-day. Each night the
+runner re-fetches `upload.sh` from `VIBER_BASE_URL` (the same trust model as
+the install command), falling back to the last cached copy when offline. The
+digest caches keep repeat runs cheap (only new sessions cost LLM work).
 
-Without a non-interactive token source the nightly run is **prepare-only**
-(full analysis, caches warmed, payload validated, nothing sent). To publish
-automatically, set `VIBER_TOKEN_COMMAND` in `~/.viber/refresh/config` to a
-command that prints a fresh submission token (self-hosted operators can point
-it at a platform management command). `upload.sh` also accepts a pre-minted
-`VIBER_SUBMIT_TOKEN` from the environment for unattended runs.
-
-Linux: use a systemd user timer with `OnCalendar=*-*-* 00:15` and
-`Persistent=true` pointing at `bin/viber-refresh`.
+Publishing unattended needs a non-interactive token. The runner tries, in
+order: `VIBER_TOKEN_COMMAND` (advanced/self-hosted), then a stored refresh
+credential at `~/.viber/refresh/credential` exchanged at
+`VIBER_TOKEN_REFRESH_URL` (issued by the platform's refresh-credential
+endpoint). With neither, nightly runs are **prepare-only** — full analysis,
+caches warmed, payload validated, nothing sent — and a notification says so.
+Config lives at `~/.viber/refresh/config`; set `VIBER_REFRESH_DISABLED=1`
+for a temporary off-switch.
