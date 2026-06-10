@@ -13,6 +13,12 @@ whole submission.
 This tool is **open source** and runs in **your** agent — you can read every line, watch it work,
 and diff the exact payload with `--dry-run` before anything is sent.
 
+The bundled MCP server also provides local-only discovery helpers:
+`discover_local_sources()`, `build_episode_candidates()`, and `git_aggregate_metrics()`. These
+helpers read Claude/Codex/Cursor transcript stores and host-side git metadata for the selected
+project, but send nothing over the network. Cursor extraction uses `sqlite3` against Cursor's
+`state.vscdb` in read-only immutable mode and only counts project-scoped rows.
+
 ---
 
 ## What leaves your machine (allowlisted, redacted)
@@ -54,7 +60,7 @@ client telemetry.
 | Secrets, API keys, tokens, JWTs, PEM keys, DB URLs with creds | Layer-1 secret scrubber, fail-closed. |
 | Other repos, remotes, org names | **Project-scoped only.** The skill analyzes the one chosen project and never enumerates, catalogs, or transmits other repos/remotes/orgs. `repos_considered` is asserted `== 1`. |
 | `~/.ssh`, `~/.aws`, keychains, env files, the docker socket | Out of scope; the analyzer reads only agent-transcript locations + host-side `git`. |
-| A second persisted copy of your raw data | Any working cache is **ephemeral** and purged on completion. No `~/.viber/cache` of raw transcripts. |
+| A second persisted copy of your raw data | Any working cache is **ephemeral** and purged on completion. No `~/.viber/cache` of raw transcripts. The score replay cache stores only request digests and returned nonce payloads. |
 
 > Two of these rows — **host-side git derivation** (never reading working-tree blobs) and the
 > **ephemeral cache** (no second persisted copy) — are guarantees of the open-source client/runtime,
@@ -96,6 +102,10 @@ canonical_scores)`, where `digest = SHA-256(JCS({episode_id, type, scores}))` an
 canonical JSON. The `handle` binding stops a nonce issued to one developer being replayed in
 another's submission.
 
+The proxy also stores a server-computed `request_digest` for the redacted score request. Retrying
+the same score request with the same submission token returns the already-issued nonce instead of
+minting a duplicate nonce that would later trip the full-coverage guard.
+
 On submission, public-dj does **not** merely check that the nonce exists — it **recomputes** the
 digest and HMAC from the *submitted* episode using its own key, and treats the **proxy-log scores as
 authoritative** (overwriting whatever the client submitted). It also (a) requires the submitted
@@ -103,11 +113,46 @@ episodes to cover **every** `request_id` the proxy issued for that submission to
 cannot silently drop low-scoring episodes, and (b) **recomputes all aggregates** (`dimensions.*`,
 `overall_score`, `overall_grade`) from the verified episode scores — the headline numbers users see
 are server-derived, not client-asserted. Any episode that fails recomputation is **held**
-(`verified=false`), never trusted. Profiles are **append-only and non-editable** — re-running
-regenerates and replaces; there is no manual edit path.
+(`verified=false`), never trusted. Profiles are **append-only and non-editable**. Exact duplicate
+submits return the existing snapshot receipt instead of appending a duplicate; changed submissions
+append a new snapshot. There is no manual edit path.
 
 ## Verify it yourself
 
 - Read [`schema/profile.schema.json`](../schema/profile.schema.json) — the hard allowlist.
 - Run the bootstrap with `--dry-run` to print the exact payload and send nothing.
 - Read [`skill/SKILL.md`](../skill/SKILL.md) and [`mcp/`](../mcp/) — the analysis and the submit tool are open source.
+
+## Schema 1.1.0 additions (wrapped behavioral aggregates)
+
+Schema 1.1.0 adds OPTIONAL aggregate blocks. Every new field is numeric, enum-bounded, a fixed-size
+histogram, or a salted opaque ref; **no new free-text fields were added**. Specifically:
+
+- `vibe_metrics.model_usage` — model-FAMILY names from a fixed client-side allowlist map
+  (`claude-opus-4-8` -> "Opus 4.8"); raw ids that do not normalize are dropped fail-closed, so this
+  field can never carry free text.
+- `vibe_metrics.{plan_mode, interruption, concurrency, prompt_stats, event_hour_histogram_local,
+  longest_agent_run, last_30_days}` — counts, ratios, durations, and 24-bin LOCAL-clock histograms.
+  Prompt statistics are computed over human prompts only and ship as NUMBERS (word-count buckets,
+  politeness/question/crash-out counts); the prompts themselves never leave the machine. Local-hour
+  binning uses per-commit UTC offsets (git) or the host's current offset (transcripts); the
+  timezone identifier itself is never shipped.
+- `git_metrics.{commit_hour_histogram_local, commits_by_weekday_local, loc_added_by_weekday_local,
+  night_owl_share, biggest_push, pr_metrics, last_30_days}` — author-filtered aggregate counts.
+  `biggest_push` carries the WEEKDAY only, never the date (a date would be cross-referenceable
+  against public repo activity given the handle). The author emails used for filtering are detected
+  locally and never serialized.
+- `work_streams[]` — salted opaque stream refs with session/commit counts and durations only.
+- `craft_stats`, `economics_stats`, `orchestration_stats`, `identity_stats` — derived rates,
+  medians, and counts (edit precision, red-to-green recovery, blast radius, churn, cache hit rate,
+  delegation depth, build streaks, tool loyalty, session shape). All numbers/enums.
+- `operating_level`, `specialty_signals`, `decisions[].{initiative,outcome_evidence,topics}` —
+  rubric 1.1 stubs (band enums, topic enums, confidence numbers, evidence excerpts that pass the
+  same double-redaction as all excerpt fields). Not populated until the rubric 1.1 release;
+  public-dj serves operating_level only for maturity-established profiles.
+- `client_telemetry.classifier_version` — the versioned command-classifier behind the test/build
+  classification rates, for reproducibility.
+
+The verbatim-quote insights (cryptic prompt, crash-out quote, go-to phrase) remain EXCLUDED: only
+their numeric counts ship. Any future verbatim tier requires a schema 1.2.0 consent object, per-quote
+approval, and an explicit amendment to this document.

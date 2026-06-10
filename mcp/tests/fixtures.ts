@@ -6,7 +6,7 @@
 export function makeValidProfile(): Record<string, unknown> {
   const episodeId = "a1b2c3d4e5f60718";
   return {
-    schema_version: "1.0.0",
+    schema_version: "1.1.0",
     rubric_version: "1.0.0",
     handle: "octocat",
     generated_at: "2026-06-07T12:00:00Z",

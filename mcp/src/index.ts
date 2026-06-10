@@ -1,4 +1,21 @@
 export { resolveConfig, type ViberMcpConfig } from "./config.js";
+export {
+  buildEpisodeCandidates,
+  buildActualMetrics,
+  discoverLocalSources,
+  gitAggregateMetrics,
+  type ActualMetricsBundle,
+  type ActualMetricsToolCoverage,
+  type ActualVibeMetrics,
+  type AgentTool,
+  type DecisionCandidate,
+  type EpisodeCandidate,
+  type EpisodeCandidateBundle,
+  type GitAggregateMetrics,
+  type LocalSourceDiscovery,
+  type SessionMetadataCandidate,
+  type ToolCoverage,
+} from "./extractors.js";
 export { buildAnalysisManifest, type AnalysisManifest } from "./manifest.js";
 export {
   detectViolations,

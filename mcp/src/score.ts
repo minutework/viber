@@ -5,10 +5,16 @@
  * process. Keep scoring behind the MCP so the agent never has to print, persist,
  * or shell-interpolate the token when requesting public-dj integrity nonces.
  */
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+
 export interface ScoreEpisodesOptions {
   episodes: unknown;
   token: string;
   scoreUrl: string;
+  /** Optional 0700 scratch dir. Stores digest -> scored nonce only, never raw episode summaries. */
+  cacheDir?: string;
   /** Injectable for tests; defaults to global fetch. */
   fetchImpl?: typeof fetch;
 }
@@ -28,13 +34,43 @@ export async function scoreEpisodes(options: ScoreEpisodesOptions): Promise<Scor
     return { ok: false, errors: ["At least one episode is required for scoring."] };
   }
 
+  const episodeRequests = options.episodes.map((episode) => ({
+    episode,
+    requestDigest: scoreRequestDigest(episode),
+  }));
+  const cache = readScoreCache(options.cacheDir);
+  const cachedEpisodes = new Map<string, unknown>();
+  const missingEpisodes: unknown[] = [];
+  const missingDigests: string[] = [];
+  for (const request of episodeRequests) {
+    const cached = cache.entries[request.requestDigest];
+    if (cached) {
+      cachedEpisodes.set(request.requestDigest, cached);
+    } else {
+      missingEpisodes.push(request.episode);
+      missingDigests.push(request.requestDigest);
+    }
+  }
+
+  if (missingEpisodes.length === 0) {
+    return {
+      ok: true,
+      status: 200,
+      responseBody: {
+        handle: cache.handle ?? null,
+        episodes: episodeRequests.map((request) => cachedEpisodes.get(request.requestDigest)),
+      },
+      errors: [],
+    };
+  }
+
   const fetchImpl = options.fetchImpl ?? fetch;
   let response: Response;
   try {
     response = await fetchImpl(options.scoreUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token: options.token, episodes: options.episodes }),
+      body: JSON.stringify({ token: options.token, episodes: missingEpisodes }),
     });
   } catch (cause) {
     return {
@@ -60,10 +96,106 @@ export async function scoreEpisodes(options: ScoreEpisodesOptions): Promise<Scor
     };
   }
 
+  const mergedBody = mergeAndCacheScoredEpisodes({
+    responseBody,
+    cache,
+    cacheDir: options.cacheDir,
+    missingDigests,
+    cachedEpisodes,
+    episodeRequests,
+  });
+
   return {
     ok: true,
     status: response.status,
-    responseBody,
+    responseBody: mergedBody,
     errors: [],
   };
+}
+
+interface ScoreCache {
+  handle?: string | null;
+  entries: Record<string, unknown>;
+}
+
+function mergeAndCacheScoredEpisodes(options: {
+  responseBody: unknown;
+  cache: ScoreCache;
+  cacheDir?: string;
+  missingDigests: string[];
+  cachedEpisodes: Map<string, unknown>;
+  episodeRequests: Array<{ episode: unknown; requestDigest: string }>;
+}): unknown {
+  if (!options.responseBody || typeof options.responseBody !== "object") {
+    return options.responseBody;
+  }
+  const responseRecord = options.responseBody as Record<string, unknown>;
+  const scoredEpisodes = Array.isArray(responseRecord.episodes) ? responseRecord.episodes : [];
+  scoredEpisodes.forEach((episode, index) => {
+    const digest = options.missingDigests[index];
+    if (!digest) {
+      return;
+    }
+    options.cache.entries[digest] = episode;
+    options.cachedEpisodes.set(digest, episode);
+  });
+  if (typeof responseRecord.handle === "string") {
+    options.cache.handle = responseRecord.handle;
+  }
+  writeScoreCache(options.cacheDir, options.cache);
+  return {
+    ...responseRecord,
+    episodes: options.episodeRequests.map((request) => options.cachedEpisodes.get(request.requestDigest)),
+  };
+}
+
+function scoreRequestDigest(episode: unknown): string {
+  const record = episode && typeof episode === "object" ? (episode as Record<string, unknown>) : {};
+  const canonical = canonicalJson({
+    episode_id: String(record.episode_id ?? ""),
+    type: String(record.type ?? "other"),
+    summary: String(record.summary ?? record.title ?? ""),
+  });
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
+function readScoreCache(cacheDir: string | undefined): ScoreCache {
+  if (!cacheDir) {
+    return { entries: {} };
+  }
+  const cachePath = path.join(cacheDir, "score-cache.json");
+  if (!existsSync(cachePath)) {
+    return { entries: {} };
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(cachePath, "utf8")) as ScoreCache;
+    if (!parsed || typeof parsed !== "object" || !parsed.entries || typeof parsed.entries !== "object") {
+      return { entries: {} };
+    }
+    return parsed;
+  } catch {
+    return { entries: {} };
+  }
+}
+
+function writeScoreCache(cacheDir: string | undefined, cache: ScoreCache): void {
+  if (!cacheDir) {
+    return;
+  }
+  const cachePath = path.join(cacheDir, "score-cache.json");
+  writeFileSync(cachePath, JSON.stringify(cache), { mode: 0o600 });
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(",")}}`;
 }

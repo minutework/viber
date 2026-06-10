@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 
 import { validateProfileAgainstSchema } from "../src/schema.ts";
@@ -139,4 +142,57 @@ test("score_episodes POSTs token inside JSON body and returns scored nonce paylo
     token: "signed-token-xyz",
     episodes: [{ episode_id: "abc123", type: "feature", summary: "Redacted steering episode." }],
   });
+});
+
+test("score_episodes replays from digest-only scratch cache without another network call", async () => {
+  const cacheDir = mkdtempSync(path.join(tmpdir(), "viber-score-cache-"));
+  try {
+    let fetchCount = 0;
+    const fetchImpl = (async () => {
+      fetchCount += 1;
+      return new Response(
+        JSON.stringify({
+          handle: "octocat",
+          episodes: [
+            {
+              episode_id: "abc123",
+              type: "feature",
+              scores: { steering: 80 },
+              confidence: 0.7,
+              nonce: {
+                request_id: "req_abcDEF0123456789",
+                signature: "sig",
+                digest: "dig",
+                issued_at: "2026-06-07T11:59:00Z",
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+
+    const episode = { episode_id: "abc123", type: "feature", summary: "Redacted steering episode." };
+    const first = await scoreEpisodes({
+      token: "signed-token-xyz",
+      scoreUrl: "https://viber.minutework.ai/api/v1/builder-profiles/score/",
+      episodes: [episode],
+      cacheDir,
+      fetchImpl,
+    });
+    const second = await scoreEpisodes({
+      token: "signed-token-xyz",
+      scoreUrl: "https://viber.minutework.ai/api/v1/builder-profiles/score/",
+      episodes: [episode],
+      cacheDir,
+      fetchImpl,
+    });
+
+    assert.equal(first.ok, true);
+    assert.equal(second.ok, true);
+    assert.equal(fetchCount, 1);
+    assert.deepEqual(second.responseBody, first.responseBody);
+  } finally {
+    rmSync(cacheDir, { recursive: true, force: true });
+  }
 });

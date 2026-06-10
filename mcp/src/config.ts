@@ -15,6 +15,8 @@ export interface ViberMcpConfig {
   scoreUrl: string;
   token: string;
   dryRun: boolean;
+  selectedProjectPath: string;
+  scratchDir: string;
 }
 
 export function resolveConfig(env: NodeJS.ProcessEnv, argDryRun: boolean): ViberMcpConfig {
@@ -23,5 +25,7 @@ export function resolveConfig(env: NodeJS.ProcessEnv, argDryRun: boolean): Viber
   const scoreUrl = env.VIBER_SCORE_URL ?? `${base}${SCORE_PATH}`;
   const token = env.VIBER_SUBMIT_TOKEN ?? "";
   const dryRun = argDryRun || env.VIBER_DRY_RUN === "1" || env.VIBER_DRY_RUN === "true";
-  return { ingestUrl, scoreUrl, token, dryRun };
+  const selectedProjectPath = env.VIBER_SELECTED_PROJECT_PATH ?? process.cwd();
+  const scratchDir = env.VIBER_SCRATCH_DIR ?? "";
+  return { ingestUrl, scoreUrl, token, dryRun, selectedProjectPath, scratchDir };
 }

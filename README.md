@@ -8,6 +8,8 @@ credential is the entry gate to [MinuteWork](https://minutework.ai)'s vibe-engin
 curl -fsSL https://viber.minutework.ai/upload.sh | bash
 ```
 
+Run it from the project root you want to profile, or pass `--project /path/to/project`.
+
 ## How it works (and why you can trust it)
 
 This tool is **open source** and runs **inside your own coding agent, on your own subscription**.
@@ -21,8 +23,9 @@ Sign-in uses a **PKCE GitHub-OAuth loopback handoff** against the MinuteWork pla
 (`VIBER_PLATFORM_BASE_URL`): the bootstrap generates a PKCE verifier locally, opens your browser to
 the platform start URL with only a `127.0.0.1` `redirect_uri` + the S256 `code_challenge`, receives a
 single-use authorization **code** on a local listener, then exchanges that code for a short-lived
-**signed submission token** — which is held in memory and passed to the submit MCP via env only,
-never written to disk.
+**signed submission token** plus a platform refresh credential. The submission token is held in
+memory and passed to the submit MCP via env only, never written to disk. The refresh credential is
+written to `~/.viber/refresh/credential` only if you opt into the daily refresh.
 
 - **Privacy:** a hard allowlist ([`schema/profile.schema.json`](schema/profile.schema.json)) + two
   fail-closed redaction layers (secrets, then code/paths/identifiers), enforced on both the client
@@ -69,3 +72,47 @@ npm run typecheck      # tsc, no emit
 npm run build          # tsc -> dist/ + vendor the frozen schema
 npm test               # node --test (redaction + schema + dry-run + submit)
 ```
+
+## Living profile (daily refresh)
+
+A profile should never go stale. The bootstrap itself installs a daily
+refresh — no repo checkout needed. After a successful run it offers:
+
+    viber: keep this profile LIVE with a daily refresh at 12:15 AM ...? [Y/n]
+
+or do it explicitly:
+
+```sh
+curl -fsSL https://viber.minutework.ai/upload.sh | bash -s -- --schedule-only --project /path/to/project
+curl -fsSL https://viber.minutework.ai/upload.sh | bash -s -- --schedule-uninstall
+```
+
+What gets installed: a small runner at `~/.viber/bin/viber-refresh` plus a
+macOS LaunchAgent (or a Linux systemd user timer with `Persistent=true`).
+It fires at **00:15 local time**; firings missed while asleep are coalesced
+by the OS, and a login/boot firing covers machines powered off at midnight —
+a local-date stamp makes catch-ups at-most-once-per-day. Each night the
+runner re-fetches `upload.sh` from `VIBER_BASE_URL` (the same trust model as
+the install command), falling back to the last cached copy when offline. The
+digest caches keep repeat runs cheap (only new sessions cost LLM work).
+
+Publishing unattended uses the refresh credential issued during the interactive
+run. It lives at `~/.viber/refresh/credential` (`0600`) and is exchanged nightly
+at `VIBER_TOKEN_REFRESH_URL` for a 15-minute submission token; rotated
+credentials atomically replace the local file. The refresh credential is never
+passed to the MCP server or coding agent. If the credential is missing,
+expired, or rejected, nightly runs fall back to **prepare-only** — full
+analysis, caches warmed, payload validated, nothing sent — and a notification
+says "publish needs re-auth."
+
+Controls:
+
+```sh
+~/.viber/bin/viber-refresh --status
+~/.viber/bin/viber-refresh --force
+curl -fsSL https://viber.minutework.ai/upload.sh | bash -s -- --schedule-only --project /path/to/project
+curl -fsSL https://viber.minutework.ai/upload.sh | bash -s -- --schedule-uninstall
+```
+
+Config lives at `~/.viber/refresh/config`; set `VIBER_REFRESH_DISABLED=1`
+for a temporary off-switch.
