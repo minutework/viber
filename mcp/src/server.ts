@@ -8,6 +8,7 @@ import { resolveConfig, type ViberMcpConfig } from "./config.js";
 import { buildWrappedAggregates } from "./aggregates.js";
 import { buildActualMetrics, buildEpisodeCandidates, discoverLocalSources, gitAggregateMetrics } from "./extractors.js";
 import { buildAnalysisManifest } from "./manifest.js";
+import { analyzeRepoArchitecture } from "./repo-architecture.js";
 import { scoreEpisodes } from "./score.js";
 import { submitProfile } from "./submit.js";
 
@@ -139,6 +140,40 @@ export function createViberMcpServer(config: ViberMcpConfig) {
         buildWrappedAggregates({
           projectPath: config.selectedProjectPath,
           maxSessions: input.max_sessions,
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "analyze_repo_architecture",
+    {
+      description:
+        "Local-only deterministic repo-architecture scan (repo_rubric 1.0.0) of one repository working tree: a fixed " +
+        "10-dimension scorecard (documentation, testing, ci_automation, type_safety, dependency_hygiene, " +
+        "security_posture, modularity, architecture, maintainability, release_ops) made of counts, ratios, booleans, " +
+        "and enums, plus a local_only block of repo-relative candidate paths for the host agent's LLM-judged " +
+        "dimensions. The local_only block must never be copied into a profile. Secret scanning emits counts only — " +
+        "never secret values or locations. Outside local_only there are no paths, file names, repo names, or free " +
+        "text; repos are identified by primary language and size band only. Sends nothing over the network.",
+      inputSchema: {
+        repo_path: z
+          .string()
+          .min(1)
+          .max(4096)
+          .optional()
+          .describe("Optional absolute path of the repository working tree to scan. Defaults to the selected project path."),
+        project_path: z
+          .string()
+          .min(1)
+          .max(4096)
+          .optional()
+          .describe("Optional alias for repo_path; repo_path wins when both are provided."),
+      },
+    },
+    async (input: { repo_path?: string; project_path?: string }) =>
+      createStructuredToolResult(
+        analyzeRepoArchitecture({
+          repoPath: input.repo_path ?? input.project_path ?? config.selectedProjectPath,
         }),
       ),
   );
