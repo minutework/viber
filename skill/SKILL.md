@@ -86,7 +86,8 @@ Start with the local-only `viber-mcp` helpers when available:
 
 1. `discover_local_sources()` — coverage by tool for the selected project.
 2. `build_actual_metrics()` — uncapped aggregate-only totals for vibe agent-hours,
-   active calendar-hours, provider-reported tokens, coverage, and vibe LOC. Put its
+   active calendar-hours, provider-reported tokens, coverage, and all-source vibe LOC
+   (committed + tracked working-tree + untracked code-file counts). Put its
    `vibe_metrics` object directly on the submitted profile; never derive public totals
    from the capped episode sample.
 3. `build_episode_candidates()` — redacted episode candidates, session metadata, decisions

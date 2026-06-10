@@ -153,8 +153,18 @@
         "commit_count": { "type": "integer", "minimum": 0 },
         "lines_added": { "type": "integer", "minimum": 0 },
         "lines_deleted": { "type": "integer", "minimum": 0 },
+        "vibe_loc_sources": {
+          "description": "Numeric-only source breakdown for Vibe LOC. committed is author-filtered git history; tracked_working_tree is git diff additions; untracked is safe code-file line counts after local denylist filtering.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "committed": { "type": "integer", "minimum": 0 },
+            "tracked_working_tree": { "type": "integer", "minimum": 0 },
+            "untracked": { "type": "integer", "minimum": 0 }
+          }
+        },
         "vibe_loc_by_period": {
-          "description": "Lines-added breakdown for profile display. UTC calendar buckets only; no paths, filenames, commit hashes, author data, or repo identifiers.",
+          "description": "Lines-added breakdown for leaderboard/global comparison. UTC calendar buckets only; no paths, filenames, commit hashes, author data, or repo identifiers.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -163,6 +173,22 @@
             "this_month": { "type": "integer", "minimum": 0 },
             "this_year": { "type": "integer", "minimum": 0 }
           }
+        },
+        "vibe_loc_by_local_period": {
+          "description": "Lines-added breakdown for profile display using the builder machine's local calendar buckets. No paths, filenames, commit hashes, author data, or repo identifiers.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "today": { "type": "integer", "minimum": 0 },
+            "this_week": { "type": "integer", "minimum": 0 },
+            "this_month": { "type": "integer", "minimum": 0 },
+            "this_year": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "metrics_timezone": {
+          "description": "Coarse local offset used for local-period profile display, e.g. UTC-07:00. Never an IANA location.",
+          "type": "string",
+          "pattern": "^UTC[+-][0-9]{2}:[0-9]{2}$"
         },
         "files_changed_count": { "type": "integer", "minimum": 0 },
         "active_days": { "type": "integer", "minimum": 0 },
@@ -274,9 +300,23 @@
             "this_year": { "type": "integer", "minimum": 0 }
           }
         },
-        "total_vibe_loc": { "type": "integer", "minimum": 0 },
+        "total_vibe_loc": {
+          "description": "Total public Vibe LOC: committed git insertions plus tracked working-tree additions plus untracked code-file lines after local denylist filtering.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "vibe_loc_sources": {
+          "description": "Numeric-only source breakdown for total_vibe_loc. No file paths, filenames, hashes, repo names, authors, or code.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "committed": { "type": "integer", "minimum": 0 },
+            "tracked_working_tree": { "type": "integer", "minimum": 0 },
+            "untracked": { "type": "integer", "minimum": 0 }
+          }
+        },
         "vibe_loc_by_period": {
-          "description": "Lines-added breakdown for profile display. UTC calendar buckets only; no paths, filenames, commit hashes, author data, or repo identifiers.",
+          "description": "Lines-added breakdown for leaderboard/global comparison. UTC calendar buckets only; no paths, filenames, commit hashes, author data, or repo identifiers.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -285,6 +325,22 @@
             "this_month": { "type": "integer", "minimum": 0 },
             "this_year": { "type": "integer", "minimum": 0 }
           }
+        },
+        "vibe_loc_by_local_period": {
+          "description": "Lines-added breakdown for profile display using the builder machine's local calendar buckets. No paths, filenames, commit hashes, author data, or repo identifiers.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "today": { "type": "integer", "minimum": 0 },
+            "this_week": { "type": "integer", "minimum": 0 },
+            "this_month": { "type": "integer", "minimum": 0 },
+            "this_year": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "metrics_timezone": {
+          "description": "Coarse local offset used for local-period profile display, e.g. UTC-07:00. Never an IANA location.",
+          "type": "string",
+          "pattern": "^UTC[+-][0-9]{2}:[0-9]{2}$"
         },
         "metrics_coverage": {
           "type": "object",
