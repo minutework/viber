@@ -36,6 +36,7 @@ export interface LocalExtractorOptions {
   cursorWorkspaceStorageDir?: string;
   sqlitePath?: string;
   gitPath?: string;
+  now?: Date;
 }
 
 export interface ToolCoverage {
@@ -168,12 +169,15 @@ export interface GitAggregateMetrics {
     commit_count: number;
     lines_added: number;
     lines_deleted: number;
+    vibe_loc_sources?: VibeLocSources;
     vibe_loc_by_period: {
       today: number;
       this_week: number;
       this_month: number;
       this_year: number;
     };
+    vibe_loc_by_local_period?: MetricsPeriodBreakdown;
+    metrics_timezone?: string;
     files_changed_count: number;
     active_days: number;
     commits_per_active_day: number;
@@ -201,6 +205,12 @@ export type MetricsPeriodKey = "today" | "this_week" | "this_month" | "this_year
 
 export type MetricsPeriodBreakdown = Record<MetricsPeriodKey, number>;
 
+export interface VibeLocSources {
+  committed: number;
+  tracked_working_tree: number;
+  untracked: number;
+}
+
 export interface ActualMetricsToolCoverage {
   tool: AgentTool;
   session_count: number;
@@ -224,7 +234,10 @@ export interface ActualVibeMetrics {
   active_calendar_hours_by_period: MetricsPeriodBreakdown;
   provider_tokens_by_period: MetricsPeriodBreakdown;
   total_vibe_loc?: number;
+  vibe_loc_sources?: VibeLocSources;
   vibe_loc_by_period?: MetricsPeriodBreakdown;
+  vibe_loc_by_local_period?: MetricsPeriodBreakdown;
+  metrics_timezone?: string;
   metrics_coverage: {
     tools: Record<AgentTool, ActualMetricsToolCoverage>;
     totals: {
@@ -427,7 +440,16 @@ export function buildActualMetrics(options: LocalExtractorOptions = {}): ActualM
     ...(gitMetrics.git_metrics
       ? {
           total_vibe_loc: gitMetrics.git_metrics.lines_added,
+          ...(gitMetrics.git_metrics.vibe_loc_sources
+            ? { vibe_loc_sources: gitMetrics.git_metrics.vibe_loc_sources }
+            : {}),
           vibe_loc_by_period: gitMetrics.git_metrics.vibe_loc_by_period,
+          ...(gitMetrics.git_metrics.vibe_loc_by_local_period
+            ? { vibe_loc_by_local_period: gitMetrics.git_metrics.vibe_loc_by_local_period }
+            : {}),
+          ...(gitMetrics.git_metrics.metrics_timezone
+            ? { metrics_timezone: gitMetrics.git_metrics.metrics_timezone }
+            : {}),
         }
       : {}),
     metrics_coverage: {
@@ -606,11 +628,73 @@ const GENERATED_LOCK_BASENAMES = new Set([
 
 const GENERATED_DIR_RE = /(^|\/)(node_modules|vendor|dist|build|out|\.next|target|__generated__|generated|coverage)\//;
 const GENERATED_SUFFIX_RE = /\.(min\.js|min\.css|map|snap)$/;
+const NON_VIBE_LOC_DIR_RE = /(^|\/)(reference|references|tmp|temp)\//;
+const SENSITIVE_UNTRACKED_BASENAMES = new Set([
+  ".env",
+  ".env.local",
+  ".env.development",
+  ".env.production",
+  ".env.test",
+]);
+const COUNTABLE_UNTRACKED_BASENAMES = new Set([
+  "dockerfile",
+  "makefile",
+  "justfile",
+  "procfile",
+  "gemfile",
+]);
+const COUNTABLE_UNTRACKED_EXTENSIONS = new Set([
+  "c",
+  "cc",
+  "cfg",
+  "conf",
+  "cpp",
+  "cs",
+  "css",
+  "csv",
+  "cts",
+  "go",
+  "h",
+  "hcl",
+  "hpp",
+  "html",
+  "java",
+  "js",
+  "json",
+  "jsx",
+  "kt",
+  "lua",
+  "md",
+  "mjs",
+  "mts",
+  "php",
+  "py",
+  "rb",
+  "rs",
+  "scss",
+  "sh",
+  "sql",
+  "swift",
+  "toml",
+  "ts",
+  "tsx",
+  "txt",
+  "xml",
+  "yaml",
+  "yml",
+]);
+const MAX_UNTRACKED_LOC_FILE_BYTES = 2 * 1024 * 1024;
 
 export function isGeneratedArtifactPath(filePath: string): boolean {
   const lower = filePath.toLowerCase();
   const base = lower.split("/").pop() ?? "";
-  return GENERATED_LOCK_BASENAMES.has(base) || GENERATED_SUFFIX_RE.test(base) || GENERATED_DIR_RE.test(lower);
+  return (
+    GENERATED_LOCK_BASENAMES.has(base) ||
+    SENSITIVE_UNTRACKED_BASENAMES.has(base) ||
+    GENERATED_SUFFIX_RE.test(base) ||
+    GENERATED_DIR_RE.test(lower) ||
+    NON_VIBE_LOC_DIR_RE.test(lower)
+  );
 }
 
 /**
@@ -811,6 +895,7 @@ export function gitAggregateMetrics(options: LocalExtractorOptions = {}): GitAgg
   const context = createExtractorContext(options);
   const gitPath = options.gitPath ?? "git";
   const repoPath = context.selectedProjectPath;
+  const now = options.now ?? new Date();
   const warnings: string[] = [];
   const gitCheck = spawnSync(gitPath, ["-C", repoPath, "rev-parse", "--show-toplevel"], {
     encoding: "utf8",
@@ -910,14 +995,26 @@ export function gitAggregateMetrics(options: LocalExtractorOptions = {}): GitAgg
   if (recentCommits.length < Math.min(commits.length, 50)) {
     warnings.push("some_recent_commit_subjects_dropped_by_redactor");
   }
+  const workingLoc = collectWorkingTreeVibeLoc({ gitPath, repoPath });
+  warnings.push(...workingLoc.warnings);
+  const committedAdded = commits.reduce((sum, commit) => sum + commit.added, 0);
+  const snapshotAdded = workingLoc.sources.tracked_working_tree + workingLoc.sources.untracked;
+  const totalVibeLoc = committedAdded + snapshotAdded;
 
   return {
     project_scope: PROJECT_SCOPE,
     git_metrics: {
       commit_count: commits.length,
-      lines_added: commits.reduce((sum, commit) => sum + commit.added, 0),
+      lines_added: totalVibeLoc,
       lines_deleted: commits.reduce((sum, commit) => sum + commit.deleted, 0),
-      vibe_loc_by_period: vibeLocByPeriod(commits),
+      vibe_loc_sources: {
+        committed: committedAdded,
+        tracked_working_tree: workingLoc.sources.tracked_working_tree,
+        untracked: workingLoc.sources.untracked,
+      },
+      vibe_loc_by_period: addSnapshotLocToPeriods(vibeLocByPeriod(commits, now), snapshotAdded),
+      vibe_loc_by_local_period: addSnapshotLocToPeriods(vibeLocByLocalPeriod(commits, now), snapshotAdded),
+      metrics_timezone: localTimezoneOffsetLabel(now),
       files_changed_count: commits.reduce((sum, commit) => sum + commit.files, 0),
       active_days: activeDays.size,
       commits_per_active_day: activeDays.size ? commits.length / activeDays.size : 0,
@@ -931,6 +1028,92 @@ export function gitAggregateMetrics(options: LocalExtractorOptions = {}): GitAgg
     recent_commits: recentCommits,
     warnings,
   };
+}
+
+function collectWorkingTreeVibeLoc({
+  gitPath,
+  repoPath,
+}: {
+  gitPath: string;
+  repoPath: string;
+}): { sources: Pick<VibeLocSources, "tracked_working_tree" | "untracked">; warnings: string[] } {
+  const warnings: string[] = [];
+  let trackedWorkingTree = 0;
+  try {
+    const output = execFileSync(gitPath, ["-C", repoPath, "diff", "--numstat", "--no-renames", "HEAD", "--"], {
+      encoding: "utf8",
+      maxBuffer: 20 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    for (const line of output.split(/\r?\n/)) {
+      if (!line) {
+        continue;
+      }
+      const [addedRaw, , fileRaw = ""] = line.split("\t");
+      if (fileRaw && isGeneratedArtifactPath(fileRaw)) {
+        continue;
+      }
+      trackedWorkingTree += parseNumstatValue(addedRaw);
+    }
+  } catch {
+    warnings.push("git_working_tree_diff_failed");
+  }
+
+  let untracked = 0;
+  try {
+    const output = execFileSync(gitPath, ["-C", repoPath, "ls-files", "--others", "--exclude-standard", "-z"], {
+      encoding: "utf8",
+      maxBuffer: 20 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    for (const filePath of output.split("\0")) {
+      if (!filePath || !isCountableUntrackedCodePath(filePath)) {
+        continue;
+      }
+      const lineCount = countUntrackedCodeLines(path.join(repoPath, filePath));
+      if (lineCount === null) {
+        warnings.push("untracked_code_line_count_skipped");
+        continue;
+      }
+      untracked += lineCount;
+    }
+  } catch {
+    warnings.push("git_untracked_files_failed");
+  }
+
+  return { sources: { tracked_working_tree: trackedWorkingTree, untracked }, warnings: [...new Set(warnings)] };
+}
+
+function isCountableUntrackedCodePath(filePath: string): boolean {
+  if (isGeneratedArtifactPath(filePath)) {
+    return false;
+  }
+  const base = filePath.split(/[\\/]/).pop()?.toLowerCase() ?? "";
+  if (COUNTABLE_UNTRACKED_BASENAMES.has(base)) {
+    return true;
+  }
+  const extension = extensionFromPath(filePath);
+  return extension !== null && COUNTABLE_UNTRACKED_EXTENSIONS.has(extension);
+}
+
+function countUntrackedCodeLines(filePath: string): number | null {
+  try {
+    const stats = statSync(filePath);
+    if (!stats.isFile() || stats.size > MAX_UNTRACKED_LOC_FILE_BYTES) {
+      return null;
+    }
+    const bytes = readFileSync(filePath);
+    if (bytes.includes(0)) {
+      return null;
+    }
+    if (bytes.length === 0) {
+      return 0;
+    }
+    const text = bytes.toString("utf8");
+    return text.endsWith("\n") ? text.split("\n").length - 1 : text.split("\n").length;
+  } catch {
+    return null;
+  }
 }
 
 function collectActualClaudeMetrics(context: ExtractorContext): ActualCollectorResult {
@@ -1452,6 +1635,18 @@ function periodStarts(now: Date): MetricsPeriodBreakdown {
   };
 }
 
+function localPeriodStarts(now: Date): MetricsPeriodBreakdown {
+  const localDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const day = now.getDay();
+  const daysSinceMonday = day === 0 ? 6 : day - 1;
+  return {
+    today: localDay,
+    this_week: localDay - daysSinceMonday * 24 * 60 * 60 * 1000,
+    this_month: new Date(now.getFullYear(), now.getMonth(), 1).getTime(),
+    this_year: new Date(now.getFullYear(), 0, 1).getTime(),
+  };
+}
+
 function hoursByPeriod(
   intervals: Array<{ startMs: number; endMs: number }>,
   now = new Date(),
@@ -1528,6 +1723,57 @@ function vibeLocByPeriod(
   }
 
   return totals;
+}
+
+function vibeLocByLocalPeriod(
+  commits: Array<{ authoredAt: string; added: number }>,
+  now = new Date(),
+): MetricsPeriodBreakdown {
+  const nowMs = now.getTime();
+  const starts = localPeriodStarts(now);
+  const totals = emptyPeriodBreakdown();
+
+  for (const commit of commits) {
+    const authoredMs = parseTimestampMs(commit.authoredAt);
+    if (authoredMs === null || authoredMs > nowMs) {
+      continue;
+    }
+    if (authoredMs >= starts.today) {
+      totals.today += commit.added;
+    }
+    if (authoredMs >= starts.this_week) {
+      totals.this_week += commit.added;
+    }
+    if (authoredMs >= starts.this_month) {
+      totals.this_month += commit.added;
+    }
+    if (authoredMs >= starts.this_year) {
+      totals.this_year += commit.added;
+    }
+  }
+
+  return totals;
+}
+
+function addSnapshotLocToPeriods(periods: MetricsPeriodBreakdown, snapshotAdded: number): MetricsPeriodBreakdown {
+  if (snapshotAdded <= 0) {
+    return periods;
+  }
+  return {
+    today: periods.today + snapshotAdded,
+    this_week: periods.this_week + snapshotAdded,
+    this_month: periods.this_month + snapshotAdded,
+    this_year: periods.this_year + snapshotAdded,
+  };
+}
+
+function localTimezoneOffsetLabel(now = new Date()): string {
+  const offsetMinutes = -now.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMinutes);
+  const hours = String(Math.floor(abs / 60)).padStart(2, "0");
+  const minutes = String(abs % 60).padStart(2, "0");
+  return `UTC${sign}${hours}:${minutes}`;
 }
 
 function startOfUtcDay(value: Date): number {

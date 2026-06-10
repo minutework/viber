@@ -264,3 +264,94 @@ test("gitAggregateMetrics returns aggregate stats without hashes, authors, or pa
     cleanup(root);
   }
 });
+
+test("gitAggregateMetrics counts committed, tracked working-tree, and untracked code LOC without leaking paths", () => {
+  const root = makeTempDir();
+  try {
+    const repo = path.join(root, "repo");
+    mkdirSync(path.join(repo, "src"), { recursive: true });
+    mkdirSync(path.join(repo, "reference", "yc"), { recursive: true });
+    mkdirSync(path.join(repo, "tmp"), { recursive: true });
+    execFileSync("git", ["-C", root, "init", repo], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "user.email", "dev@example.com"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "Dev User"]);
+    writeFileSync(path.join(repo, "src", "main.ts"), "export const committed = 1;\n");
+    execFileSync("git", ["-C", repo, "add", "."]);
+    execFileSync("git", ["-C", repo, "commit", "-m", "Add initial code"], {
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_DATE: "2026-06-09T12:00:00+00:00",
+        GIT_COMMITTER_DATE: "2026-06-09T12:00:00+00:00",
+      },
+    });
+
+    writeFileSync(
+      path.join(repo, "src", "main.ts"),
+      "export const committed = 1;\nexport const tracked = 2;\nexport const more = 3;\n",
+    );
+    writeFileSync(path.join(repo, "src", "untracked.ts"), "export const one = 1;\nexport const two = 2;\nexport const three = 3;\n");
+    writeFileSync(path.join(repo, "reference", "yc", "upload.sh"), "ignored\nignored\nignored\n");
+    writeFileSync(path.join(repo, "tmp", "scratch.ts"), "ignored\nignored\n");
+    writeFileSync(path.join(repo, ".env"), "SECRET=value\n");
+
+    const metrics = gitAggregateMetrics({ projectPath: repo, now: new Date("2026-06-10T12:00:00Z") });
+    assert.equal(metrics.git_metrics?.vibe_loc_sources?.committed, 1);
+    assert.equal(metrics.git_metrics?.vibe_loc_sources?.tracked_working_tree, 2);
+    assert.equal(metrics.git_metrics?.vibe_loc_sources?.untracked, 3);
+    assert.equal(metrics.git_metrics?.lines_added, 6);
+    assert.equal(metrics.git_metrics?.vibe_loc_by_period.today, 5);
+
+    const actual = buildActualMetrics({ homeDir: path.join(root, "empty-home"), projectPath: repo, now: new Date("2026-06-10T12:00:00Z") });
+    assert.equal(actual.vibe_metrics.total_vibe_loc, 6);
+    assert.deepEqual(actual.vibe_metrics.vibe_loc_sources, {
+      committed: 1,
+      tracked_working_tree: 2,
+      untracked: 3,
+    });
+
+    const serialized = JSON.stringify(actual);
+    assert.equal(serialized.includes("untracked.ts"), false);
+    assert.equal(serialized.includes("reference"), false);
+    assert.equal(serialized.includes("SECRET"), false);
+    assert.equal(serialized.includes("dev@example.com"), false);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("vibe LOC local periods include the builder's local day while UTC periods stay global", () => {
+  const previousTz = process.env.TZ;
+  process.env.TZ = "America/Los_Angeles";
+  const root = makeTempDir();
+  try {
+    const repo = path.join(root, "repo");
+    mkdirSync(path.join(repo, "src"), { recursive: true });
+    execFileSync("git", ["-C", root, "init", repo], { stdio: "ignore" });
+    execFileSync("git", ["-C", repo, "config", "user.email", "dev@example.com"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "Dev User"]);
+    writeFileSync(path.join(repo, "src", "main.ts"), "export const local = 1;\nexport const day = 2;\n");
+    execFileSync("git", ["-C", repo, "add", "."]);
+    execFileSync("git", ["-C", repo, "commit", "-m", "Local day work"], {
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_DATE: "2026-06-09T09:01:07-07:00",
+        GIT_COMMITTER_DATE: "2026-06-09T09:01:07-07:00",
+      },
+    });
+
+    const metrics = gitAggregateMetrics({ projectPath: repo, now: new Date("2026-06-10T04:39:54Z") });
+    assert.equal(metrics.git_metrics?.vibe_loc_by_period.today, 0);
+    assert.equal(metrics.git_metrics?.vibe_loc_by_period.this_week, 2);
+    assert.equal(metrics.git_metrics?.vibe_loc_by_local_period?.today, 2);
+    assert.equal(metrics.git_metrics?.metrics_timezone, "UTC-07:00");
+  } finally {
+    if (previousTz === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = previousTz;
+    }
+    cleanup(root);
+  }
+});

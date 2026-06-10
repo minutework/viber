@@ -10,6 +10,9 @@
 # Or piped (shows --agent override forwarding):
 #     curl -fsSL https://viber.minutework.ai/upload.sh | bash -s -- --agent cursor
 #
+# Run from a project root by default, or pass --project <path> when installing
+# or refreshing a different project.
+#
 # What it does:
 #   1. Detects installed coding agents (cursor-agent / codex / claude) and the
 #      one you are logged into; instructs you if none is logged in.
@@ -18,7 +21,8 @@
 #      browser to the platform GitHub-OAuth start URL, receives a single-use
 #      authorization code on a local 127.0.0.1 listener, then exchanges that code
 #      (with the PKCE verifier) for a short-lived signed submission token. The
-#      token never touches disk; it is passed to the agent via env only.
+#      token is held only in process env and the 0700 scratch dir, which is
+#      purged on exit.
 #   4. Registers the viber submit MCP (npx, token in env).
 #   5. Headlessly invokes the chosen agent (claude -p / codex exec /
 #      cursor-agent -p) pointed at the skill, READ-ONLY / least-privilege.
@@ -60,6 +64,7 @@ SCHEDULE_ONLY=0
 SCHEDULE_UNINSTALL=0
 NO_SCHEDULE=0
 NON_INTERACTIVE=0
+PROJECT_PATH=""
 
 print_usage() {
   cat <<'USAGE'
@@ -67,6 +72,7 @@ viber bootstrap
 
 Options:
   --agent <claude|codex|cursor>  Force a specific agent (else auto-pick a logged-in one).
+  --project <path>                Project root to analyze/schedule (default: current directory).
   --dry-run                      Agent prints the exact payload and sends NOTHING.
   --schedule                     After this run, install the daily living-profile refresh.
   --schedule-only                Install the daily refresh and exit (no analysis now).
@@ -94,6 +100,19 @@ while [ "$#" -gt 0 ]; do
       ;;
     --dry-run)
       DRY_RUN=1
+      shift
+      ;;
+    --project)
+      if [ "$#" -lt 2 ]; then
+        printf 'viber: --project requires a path\n' >&2
+        print_usage >&2
+        exit 2
+      fi
+      PROJECT_PATH="${2:-}"
+      shift 2
+      ;;
+    --project=*)
+      PROJECT_PATH="${1#*=}"
       shift
       ;;
     --schedule)
@@ -129,6 +148,20 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+resolve_project_path() {
+  local candidate="${1:-}"
+  if [ -z "$candidate" ]; then
+    candidate="$PWD"
+  fi
+  if [ ! -d "$candidate" ]; then
+    printf 'viber: project path does not exist or is not a directory: %s\n' "$candidate" >&2
+    exit 2
+  fi
+  (cd "$candidate" && pwd -P)
+}
+
+SELECTED_PROJECT_PATH="$(resolve_project_path "$PROJECT_PATH")"
+
 # --------------------------------------------------------------------------- #
 # Living profile — self-installing daily refresh (works from `curl | bash`)
 # --------------------------------------------------------------------------- #
@@ -147,7 +180,7 @@ done
 # Publishing: unattended runs need a non-interactive token. The runner tries,
 # in order: VIBER_TOKEN_COMMAND (advanced), then a stored refresh credential
 # at ~/.viber/refresh/credential exchanged at VIBER_TOKEN_REFRESH_URL (issued
-# by the platform once the refresh-credential endpoint ships). With neither,
+# by the platform's refresh-credential endpoint). With neither,
 # nightly runs are PREPARE-ONLY (full analysis, caches warmed, payload
 # validated, nothing sent) and a notification says so.
 
@@ -196,8 +229,12 @@ for arg in "${@:-}"; do
 done
 
 # shellcheck disable=SC1090
-[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
-[ "${VIBER_REFRESH_DISABLED:-0}" = "1" ] && { vlog "skipped: disabled"; exit 0; }
+if [ -f "$CONFIG_FILE" ]; then
+  set -a
+  . "$CONFIG_FILE"
+  set +a
+fi
+[ "${VIBER_REFRESH_DISABLED:-0}" = "1" ] && { log "skipped: disabled"; exit 0; }
 
 TODAY="$(date +%F)" # LOCAL date — the user's own midnight.
 if [ "$FORCE" -eq 0 ] && [ "$(cat "$STAMP_FILE" 2>/dev/null || true)" = "$TODAY" ]; then
@@ -208,7 +245,7 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   if [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +360 2>/dev/null)" ]; then
     rm -rf "$LOCK_DIR" && mkdir "$LOCK_DIR"
   else
-    vlog "skipped: another refresh is running"
+    log "skipped: another refresh is running"
     exit 0
   fi
 fi
@@ -218,7 +255,7 @@ trap 'rm -rf "$LOCK_DIR"' EXIT
 
 PROJECT_PATH="${VIBER_REFRESH_PROJECT_PATH:-}"
 if [ -z "$PROJECT_PATH" ] || [ ! -d "$PROJECT_PATH" ]; then
-  vlog "ERROR: VIBER_REFRESH_PROJECT_PATH missing (edit $CONFIG_FILE)"
+  log "ERROR: VIBER_REFRESH_PROJECT_PATH missing (edit $CONFIG_FILE)"
   notify "viber" "Daily refresh is not configured — edit ~/.viber/refresh/config"
   exit 1
 fi
@@ -228,9 +265,10 @@ TOKEN=""
 if [ -n "${VIBER_TOKEN_COMMAND:-}" ]; then
   TOKEN="$(sh -c "$VIBER_TOKEN_COMMAND" 2>/dev/null | tail -1 | tr -d '[:space:]')" || TOKEN=""
 elif [ -s "$REFRESH_DIR/credential" ] && [ -n "${VIBER_TOKEN_REFRESH_URL:-}" ] && command -v python3 >/dev/null 2>&1; then
-  TOKEN="$(CREDENTIAL_FILE="$REFRESH_DIR/credential" REFRESH_URL="$VIBER_TOKEN_REFRESH_URL" python3 - <<'PY' 2>/dev/null || true
+  TOKEN="$(CREDENTIAL_FILE="$REFRESH_DIR/credential" REFRESH_DIR="$REFRESH_DIR" REFRESH_URL="$VIBER_TOKEN_REFRESH_URL" python3 - <<'PY' 2>/dev/null || true
 import json, os, urllib.request
-with open(os.environ["CREDENTIAL_FILE"], encoding="utf-8") as fh:
+credential_file = os.environ["CREDENTIAL_FILE"]
+with open(credential_file, encoding="utf-8") as fh:
     credential = fh.read().strip()
 request = urllib.request.Request(
     os.environ["REFRESH_URL"],
@@ -240,7 +278,15 @@ request = urllib.request.Request(
 )
 with urllib.request.urlopen(request, timeout=30) as response:
     body = json.load(response)
-print(str(body.get("submission_token") or "").strip())
+token = str(body.get("submission_token") or "").strip()
+rotated = str(body.get("refresh_credential") or "").strip()
+if rotated:
+    tmp = os.path.join(os.environ["REFRESH_DIR"], "credential.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(rotated + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, credential_file)
+print(token)
 PY
 )"
 fi
@@ -256,7 +302,7 @@ else
     mv "$CACHED.tmp" "$CACHED"
   fi
   if [ ! -s "$CACHED" ]; then
-    vlog "ERROR: could not fetch upload.sh and no cached copy exists"
+    log "ERROR: could not fetch upload.sh and no cached copy exists"
     notify "viber" "Daily refresh failed: bootstrap unreachable and no cached copy."
     exit 1
   fi
@@ -273,10 +319,10 @@ else
   MODE="prepare-only"
 fi
 
-vlog "starting refresh (mode=$MODE, project=$PROJECT_PATH, src=$SRC)"
+log "starting refresh (mode=$MODE, project=$PROJECT_PATH, src=$SRC)"
 START_TS=$(date +%s)
 if [ -n "${VIBER_REFRESH_SIMULATE:-}" ]; then
-  vlog "simulated run"
+  log "simulated run"
   RESULT=0
 else
   set +e
@@ -288,14 +334,14 @@ ELAPSED=$(($(date +%s) - START_TS))
 
 if [ "$RESULT" -eq 0 ]; then
   printf '%s' "$TODAY" >"$STAMP_FILE"
-  vlog "refresh succeeded in ${ELAPSED}s (mode=$MODE)"
+  log "refresh succeeded in ${ELAPSED}s (mode=$MODE)"
   if [ "$MODE" = "live" ]; then
     notify "viber" "Builder profile refreshed — your live profile is up to date."
   else
     notify "viber" "Profile analysis refreshed (prepare-only). Re-run the viber bootstrap to publish."
   fi
 else
-  vlog "refresh FAILED in ${ELAPSED}s (exit $RESULT, mode=$MODE) — will retry at the next firing"
+  log "refresh FAILED in ${ELAPSED}s (exit $RESULT, mode=$MODE) — will retry at the next firing"
   notify "viber" "Daily profile refresh failed — see ~/.viber/logs/refresh.log"
   exit "$RESULT"
 fi
@@ -305,7 +351,6 @@ REFRESH_EOF
 
 write_refresh_config() {
   local config="$VIBER_HOME_DIR/refresh/config"
-  [ -f "$config" ] && return 0
   local upload_local=""
   # When the bootstrap itself is a real file on disk (cloned repo / saved
   # download), prefer re-running that exact file nightly instead of re-fetching.
@@ -314,11 +359,12 @@ write_refresh_config() {
   fi
   cat >"$config" <<EOF
 # viber daily-refresh config (sourced by ~/.viber/bin/viber-refresh).
-VIBER_REFRESH_PROJECT_PATH="$PWD"
+VIBER_REFRESH_PROJECT_PATH="$SELECTED_PROJECT_PATH"
 VIBER_BASE_URL="$VIBER_BASE_URL"
 VIBER_PUBLIC_DJ_BASE_URL="$VIBER_PUBLIC_DJ_BASE_URL"
 VIBER_PLATFORM_BASE_URL="$VIBER_PLATFORM_BASE_URL"
 VIBER_SKILL_URL="$VIBER_SKILL_URL"
+VIBER_MCP_PACKAGE="$VIBER_MCP_PACKAGE"
 VIBER_TOKEN_REFRESH_URL="${VIBER_PLATFORM_BASE_URL%/}/api/v1/developer/builder-profile/submission-token/refresh/"
 $([ -n "$AGENT" ] && printf 'VIBER_AGENT="%s"' "$AGENT" || printf '#VIBER_AGENT="claude"')
 $([ -n "$upload_local" ] && printf 'VIBER_UPLOAD_LOCAL="%s"' "$upload_local" || printf '#VIBER_UPLOAD_LOCAL=""')
@@ -330,9 +376,25 @@ EOF
   chmod 600 "$config"
 }
 
+write_refresh_credential() {
+  [ -n "${REFRESH_CREDENTIAL:-}" ] || {
+    vwarn "No refresh credential available; daily refresh will run prepare-only until you re-authenticate."
+    return 0
+  }
+  mkdir -p "$VIBER_HOME_DIR" "$VIBER_HOME_DIR/refresh"
+  chmod 700 "$VIBER_HOME_DIR" "$VIBER_HOME_DIR/refresh" 2>/dev/null || true
+  local credential="$VIBER_HOME_DIR/refresh/credential"
+  local tmp="$credential.tmp.$$"
+  printf '%s\n' "$REFRESH_CREDENTIAL" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$credential"
+  vlog "Refresh credential stored at $credential (0600)."
+}
+
 install_schedule() {
   write_refresh_runner
   write_refresh_config
+  write_refresh_credential
   local runner="$VIBER_HOME_DIR/bin/viber-refresh"
   case "$(uname -s)" in
     Darwin)
@@ -361,9 +423,13 @@ install_schedule() {
 </dict>
 </plist>
 EOF
-      launchctl bootout "gui/$(id -u)/$SCHEDULE_LABEL" >/dev/null 2>&1 || true
-      launchctl bootstrap "gui/$(id -u)" "$plist"
-      vlog "Daily refresh installed (00:15 local + catch-up at login/wake)."
+      if [ "${VIBER_SCHEDULE_INSTALL_DRY_RUN:-0}" = "1" ]; then
+        vlog "Daily refresh files written (dry-run; launchd not loaded)."
+      else
+        launchctl bootout "gui/$(id -u)/$SCHEDULE_LABEL" >/dev/null 2>&1 || true
+        launchctl bootstrap "gui/$(id -u)" "$plist"
+        vlog "Daily refresh installed (00:15 local + catch-up at login/wake)."
+      fi
       ;;
     Linux)
       if command -v systemctl >/dev/null 2>&1; then
@@ -385,9 +451,13 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-        systemctl --user daemon-reload
-        systemctl --user enable --now viber-refresh.timer
-        vlog "Daily refresh installed (systemd user timer, Persistent=true)."
+        if [ "${VIBER_SCHEDULE_INSTALL_DRY_RUN:-0}" = "1" ]; then
+          vlog "Daily refresh files written (dry-run; systemd timer not loaded)."
+        else
+          systemctl --user daemon-reload
+          systemctl --user enable --now viber-refresh.timer
+          vlog "Daily refresh installed (systemd user timer, Persistent=true)."
+        fi
       else
         vwarn "No systemd found; add a cron/anacron entry for: bash $runner"
       fi
@@ -436,7 +506,7 @@ maybe_offer_schedule() {
       *) install_schedule ;;
     esac
   else
-    vlog "Tip: install the daily living-profile refresh with: ... | bash -s -- --schedule-only"
+    vlog "Tip: install the daily living-profile refresh with: ... | bash -s -- --schedule-only --project $(printf '%q' "$SELECTED_PROJECT_PATH")"
   fi
 }
 
@@ -457,6 +527,8 @@ warn() { printf '\033[1;33m[viber]\033[0m %s\n' "$*" >&2; }
 err() { printf '\033[1;31m[viber]\033[0m %s\n' "$*" >&2; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+cd "$SELECTED_PROJECT_PATH"
 
 os_family() {
   case "$(uname -s 2>/dev/null)" in
@@ -516,7 +588,7 @@ agent_logged_in() {
 agent_binary() {
   case "$1" in
     claude) printf 'claude' ;;
-    codex) printf 'codex' ;;
+    codex) printf '%s' "${VIBER_CODEX_BIN:-codex}" ;;
     cursor) printf 'cursor-agent' ;;
     *) printf '' ;;
   esac
@@ -589,10 +661,50 @@ SKILL_DIR="${SCRATCH}/skill"
 mkdir -p "$SKILL_DIR"
 
 log "Fetching skill from ${VIBER_SKILL_URL}"
-if ! curl -fsSL "$VIBER_SKILL_URL" -o "${SKILL_DIR}/SKILL.md"; then
-  err "Failed to fetch the skill from ${VIBER_SKILL_URL}"
-  exit 1
-fi
+case "$VIBER_SKILL_URL" in
+  file://*)
+    LOCAL_SKILL_PATH="${VIBER_SKILL_URL#file://}"
+    LOCAL_SKILL_DIR=""
+    if [ -d "$LOCAL_SKILL_PATH" ]; then
+      LOCAL_SKILL_DIR="$LOCAL_SKILL_PATH"
+      cp -R "${LOCAL_SKILL_PATH}/." "$SKILL_DIR/"
+    elif [ -f "$LOCAL_SKILL_PATH" ]; then
+      if [ "$(basename "$LOCAL_SKILL_PATH")" = "SKILL.md" ]; then
+        LOCAL_SKILL_DIR="$(dirname "$LOCAL_SKILL_PATH")"
+        cp -R "${LOCAL_SKILL_DIR}/." "$SKILL_DIR/"
+      else
+        cp "$LOCAL_SKILL_PATH" "${SKILL_DIR}/SKILL.md"
+      fi
+    else
+      err "Local skill URL does not exist: ${VIBER_SKILL_URL}"
+      exit 1
+    fi
+    if [ -n "$LOCAL_SKILL_DIR" ]; then
+      LOCAL_REPO_ROOT="$LOCAL_SKILL_DIR"
+      if [ "$(basename "$LOCAL_SKILL_DIR")" = "skill" ]; then
+        LOCAL_REPO_ROOT="$(dirname "$LOCAL_SKILL_DIR")"
+      fi
+      for extra_dir in schema docs; do
+        if [ -d "${LOCAL_REPO_ROOT}/${extra_dir}" ] && [ ! -e "${SKILL_DIR}/${extra_dir}" ]; then
+          cp -R "${LOCAL_REPO_ROOT}/${extra_dir}" "${SKILL_DIR}/${extra_dir}"
+        fi
+      done
+    fi
+    ;;
+  *)
+    if ! curl -fsSL "$VIBER_SKILL_URL" -o "${SKILL_DIR}/SKILL.md"; then
+      err "Failed to fetch the skill from ${VIBER_SKILL_URL}"
+      exit 1
+    fi
+    SKILL_BASE_URL="${VIBER_SKILL_URL%/skill/SKILL.md}"
+    if [ "$SKILL_BASE_URL" != "$VIBER_SKILL_URL" ]; then
+      curl -fsSL "${SKILL_BASE_URL}/skill/rubric.md" -o "${SKILL_DIR}/rubric.md" || true
+      mkdir -p "${SKILL_DIR}/schema" "${SKILL_DIR}/docs"
+      curl -fsSL "${SKILL_BASE_URL}/schema/profile.schema.json" -o "${SKILL_DIR}/schema/profile.schema.json" || true
+      curl -fsSL "${SKILL_BASE_URL}/docs/data-handling.md" -o "${SKILL_DIR}/docs/data-handling.md" || true
+    fi
+    ;;
+esac
 
 # --------------------------------------------------------------------------- #
 # 3. PKCE GitHub-OAuth loopback handoff → signed submission token (S1 flow)
@@ -611,6 +723,7 @@ fi
 # never leaves memory and the final token never touches disk on the wire path.
 # The token is held ONLY in this shell's environment afterward.
 SUBMIT_TOKEN=""
+REFRESH_CREDENTIAL=""
 
 mint_submit_token() {
   if ! have python3; then
@@ -619,9 +732,13 @@ mint_submit_token() {
   fi
 
   TOKEN_FILE="${SCRATCH}/token"   # transient; in 700 scratch; removed on exit
+  REFRESH_CREDENTIAL_FILE="${SCRATCH}/refresh_credential"
+  REFRESH_EXPIRES_FILE="${SCRATCH}/refresh_credential_expires_at"
   PORT_FILE="${SCRATCH}/port"
   AUTHURL_FILE="${SCRATCH}/authurl"
   : >"$TOKEN_FILE"
+  : >"$REFRESH_CREDENTIAL_FILE"
+  : >"$REFRESH_EXPIRES_FILE"
   : >"$PORT_FILE"
   : >"$AUTHURL_FILE"
 
@@ -633,7 +750,8 @@ mint_submit_token() {
   VIBER_LOOPBACK_PORT="$VIBER_LOOPBACK_PORT" \
     VIBER_OAUTH_START_URL="$VIBER_OAUTH_START_URL" \
     VIBER_TOKEN_EXCHANGE_URL="$VIBER_TOKEN_EXCHANGE_URL" \
-    TOKEN_FILE="$TOKEN_FILE" PORT_FILE="$PORT_FILE" AUTHURL_FILE="$AUTHURL_FILE" \
+    TOKEN_FILE="$TOKEN_FILE" REFRESH_CREDENTIAL_FILE="$REFRESH_CREDENTIAL_FILE" \
+    REFRESH_EXPIRES_FILE="$REFRESH_EXPIRES_FILE" PORT_FILE="$PORT_FILE" AUTHURL_FILE="$AUTHURL_FILE" \
     python3 - <<'PY' &
 import base64
 import hashlib
@@ -648,6 +766,8 @@ import urllib.parse
 import urllib.request
 
 token_file = os.environ["TOKEN_FILE"]
+refresh_credential_file = os.environ["REFRESH_CREDENTIAL_FILE"]
+refresh_expires_file = os.environ["REFRESH_EXPIRES_FILE"]
 port_file = os.environ["PORT_FILE"]
 authurl_file = os.environ["AUTHURL_FILE"]
 start_url = os.environ["VIBER_OAUTH_START_URL"]
@@ -754,6 +874,14 @@ if not token:
 
 with open(token_file, "w", encoding="utf-8") as fh:
     fh.write(token)
+refresh_credential = str(body.get("refresh_credential") or "").strip()
+if refresh_credential:
+    with open(refresh_credential_file, "w", encoding="utf-8") as fh:
+        fh.write(refresh_credential)
+refresh_expires = str(body.get("refresh_credential_expires_at") or "").strip()
+if refresh_expires:
+    with open(refresh_expires_file, "w", encoding="utf-8") as fh:
+        fh.write(refresh_expires)
 PY
   LISTENER_PID="$!"
 
@@ -787,8 +915,13 @@ PY
 
   if [ -s "$TOKEN_FILE" ]; then
     SUBMIT_TOKEN="$(cat "$TOKEN_FILE")"
-    rm -f "$TOKEN_FILE"
+    REFRESH_CREDENTIAL="$(cat "$REFRESH_CREDENTIAL_FILE" 2>/dev/null || true)"
+    REFRESH_CREDENTIAL_EXPIRES_AT="$(cat "$REFRESH_EXPIRES_FILE" 2>/dev/null || true)"
+    rm -f "$TOKEN_FILE" "$REFRESH_CREDENTIAL_FILE" "$REFRESH_EXPIRES_FILE"
     log "Submission token received (held in memory only)."
+    if [ -n "$REFRESH_CREDENTIAL" ] && [ -n "${REFRESH_CREDENTIAL_EXPIRES_AT:-}" ]; then
+      log "Refresh credential received; it will be stored only if daily refresh is installed."
+    fi
     return 0
   fi
   warn "No submission token captured."
@@ -826,8 +959,8 @@ fi
 # --------------------------------------------------------------------------- #
 # 4. Build the agent invocation (read-only / least-privilege) + MCP env
 # --------------------------------------------------------------------------- #
-# The submit MCP is launched via npx; the token + endpoints are passed in env so
-# nothing sensitive is written to a config file on disk.
+# The submit MCP is launched via npx; token-bearing agent configs/wrappers live
+# only in the 0700 scratch dir and are purged on exit.
 export VIBER_SUBMIT_TOKEN="${SUBMIT_TOKEN}"
 export VIBER_PUBLIC_DJ_BASE_URL="${VIBER_PUBLIC_DJ_BASE_URL}"
 export VIBER_SELECTED_PROJECT_PATH="${PWD}"
@@ -890,9 +1023,55 @@ JSON
 
 run_codex() {
   # Codex: headless exec; sequential (no subagents). Sandbox read-only.
-  codex exec \
+  CODEX_BIN="$(agent_binary codex)"
+  CODEX_MCP_WRAPPER="${SCRATCH}/codex-viber-mcp"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf 'export VIBER_SUBMIT_TOKEN=%q\n' "${VIBER_SUBMIT_TOKEN:-}"
+    printf 'export VIBER_PUBLIC_DJ_BASE_URL=%q\n' "${VIBER_PUBLIC_DJ_BASE_URL:-}"
+    printf 'export VIBER_SELECTED_PROJECT_PATH=%q\n' "${VIBER_SELECTED_PROJECT_PATH:-}"
+    printf 'export VIBER_SCRATCH_DIR=%q\n' "${VIBER_SCRATCH_DIR:-}"
+    printf 'export VIBER_DRY_RUN=%q\n' "${VIBER_DRY_RUN:-}"
+    printf 'export VIBER_MCP_PACKAGE=%q\n' "${VIBER_MCP_PACKAGE:-@viber/mcp}"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      printf '%s\n' 'exec npx -y "$VIBER_MCP_PACKAGE" viber-mcp --dry-run'
+    else
+      printf '%s\n' 'exec npx -y "$VIBER_MCP_PACKAGE" viber-mcp'
+    fi
+  } >"$CODEX_MCP_WRAPPER"
+  chmod 700 "$CODEX_MCP_WRAPPER"
+
+  if "$CODEX_BIN" exec --help 2>/dev/null | grep -q -- "--mcp-server"; then
+    "$CODEX_BIN" exec \
+      --sandbox read-only \
+      --mcp-server "viber=${CODEX_MCP_WRAPPER}" \
+      "$PROMPT"
+    return
+  fi
+
+  codex_mcp_wrapper_toml="\"$(printf '%s' "$CODEX_MCP_WRAPPER" | sed 's/\\/\\\\/g; s/"/\\"/g')\""
+
+  CODEX_MCP_CONFIG_ARGS=(
+    -c "mcp_servers.viber.command=${codex_mcp_wrapper_toml}"
+    -c 'mcp_servers.viber.args=[]'
+  )
+  for tool in \
+    analysis_manifest \
+    discover_local_sources \
+    build_actual_metrics \
+    build_wrapped_aggregates \
+    build_episode_candidates \
+    git_aggregate_metrics \
+    score_episodes \
+    submit_profile
+  do
+    CODEX_MCP_CONFIG_ARGS+=(-c "mcp_servers.viber.tools.${tool}.approval_mode=\"approve\"")
+  done
+
+  "$CODEX_BIN" exec \
     --sandbox read-only \
-    --mcp-server "viber=${MCP_CMD}" \
+    --add-dir "$SKILL_DIR" \
+    "${CODEX_MCP_CONFIG_ARGS[@]}" \
     "$PROMPT"
 }
 
