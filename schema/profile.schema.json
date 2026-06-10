@@ -22,13 +22,17 @@
     "episode_scores",
     "redaction_report"
   ],
+  "dependentRequired": {
+    "combined_score": ["combined_grade", "repo_architecture"],
+    "combined_grade": ["combined_score", "repo_architecture"]
+  },
   "properties": {
     "schema_version": {
       "description": "Version of this schema the payload was built against. Frozen per release.",
-      "const": "1.1.0"
+      "const": "1.2.0"
     },
     "rubric_version": {
-      "description": "Version of skill/rubric.md used to score. Decoupled from the schema pin as of 1.1.0: the allowed pairings (1.1.0 schema accepts rubric 1.0.0 or 1.1.0) are enforced by a server-side compatibility map in public-dj schema_validation, not by this const.",
+      "description": "Version of skill/rubric.md used to score. Decoupled from the schema pin as of 1.1.0: the allowed pairings (the 1.1.0 and 1.2.0 schemas each accept rubric 1.0.0 or 1.1.0) are enforced by a server-side compatibility map in public-dj schema_validation, not by this const.",
       "enum": ["1.0.0", "1.1.0"]
     },
     "handle": {
@@ -732,6 +736,33 @@
         "classifier_version": { "type": "string", "maxLength": 40, "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]{0,39}$" }
       }
     },
+    "repo_architecture": {
+      "description": "OPTIONAL, presence-gated repo-architecture scorecards scored under skill/repo_rubric.md. This is the structural ARTIFACT signal, separate from the transcript SESSION signal; the two are never auto-merged. Scorecards come from explicit, per-repo user-consented LOCAL scans (the analyze_repo_architecture tool) and are SELF-REPORTED: server-side re-verification is a later slice. This block does NOT relax analysis_manifest.project_scope — repos_considered == 1 still attests that TRANSCRIPT analysis covered exactly one project; scanned repos are a separate, explicitly selected set. Contents are numbers, booleans, pinned enums, and salted hex opaque refs only, plus at most two paraphrased, double-redacted notes per repo. Repos are identified by primary_language + size_band only — never by name, path, or remote, and nothing from the scanner's local_only block may ever appear here.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo_rubric_version", "scorecards", "portfolio"],
+      "properties": {
+        "repo_rubric_version": {
+          "description": "Version of skill/repo_rubric.md (and the paired scanner) that produced these scorecards. A separate version line from schema_version/rubric_version; accepted pairings are enforced by public-dj's server-side compatibility map, not by this enum alone.",
+          "enum": ["1.0.0"]
+        },
+        "scorecards": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": { "$ref": "#/$defs/repoScorecard" }
+        },
+        "portfolio": { "$ref": "#/$defs/repoPortfolio" }
+      }
+    },
+    "combined_score": {
+      "description": "ADVISORY blended headline per skill/repo_rubric.md §6: round(0.65 * overall_score + 0.35 * repo_architecture.portfolio.mean_overall), Math.round half-up semantics (W_SESSION/W_ARTIFACT are pinned in mcp/src/repo-architecture.ts). A client display hint only — a later public-dj slice recomputes it server-side. May only be present together with repo_architecture and combined_grade (dependentRequired).",
+      "$ref": "#/$defs/score0to100"
+    },
+    "combined_grade": {
+      "description": "Grade band for combined_score, same table as overall_grade. Advisory; recomputed server-side in a later slice. May only be present together with repo_architecture and combined_score (dependentRequired).",
+      "enum": ["exceptional", "strong", "proficient", "developing", "emerging"]
+    },
     "redaction_report": {
       "description": "Client self-attestation that both redaction layers ran fail-closed. ADVISORY/telemetry only: public-dj independently re-runs BOTH redactors over EVERY text field regardless of these counts and REJECTS the whole submission on any hit. Both layer booleans must be true (a single layer is not acceptable).",
       "type": "object",
@@ -1010,6 +1041,270 @@
         "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
         "episode_count": { "type": "integer", "minimum": 1 }
       }
+    },
+    "repoDimension": {
+      "description": "One submitted repo dimension. NA-strict: status 'na' means NO evidence either way and the score key is OMITTED entirely (never null); evidence of weak practice is a LOW SCORE with status 'scored', never 'na'; a dimension key is never dropped. The scanner-side 'llm_required' status never ships — the host agent LLM-scores architecture locally (repo_rubric.md §2.8) before assembly, or sets 'na'.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["scored", "na"] },
+        "score": { "$ref": "#/$defs/score0to100" }
+      }
+    },
+    "repoMaintainabilityDimension": {
+      "description": "maintainability additionally carries deterministic_score: the scanner's reproducible anchor (repo_rubric.md §2.9). score may differ from deterministic_score only via the host agent's bounded, marker-grounded local refinement; deterministic_score is never adjusted. Both score keys are OMITTED when status is 'na'.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["scored", "na"] },
+        "score": { "$ref": "#/$defs/score0to100" },
+        "deterministic_score": { "$ref": "#/$defs/score0to100" }
+      }
+    },
+    "repoMarkers": {
+      "description": "Deterministic scanner markers, copied VERBATIM from analyze_repo_architecture (repo_rubric.md §2): numbers and booleans ONLY, the full pinned key set per dimension, always fully present even when the dimension is 'na'. The secret scan contributes COUNTS only — never values or locations. The scan's local_only block (repo-relative paths) must NEVER appear in a profile.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["documentation", "testing", "ci_automation", "type_safety", "dependency_hygiene", "security_posture", "modularity", "architecture", "maintainability", "release_ops"],
+      "properties": {
+        "documentation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["readme_present", "readme_bytes", "docs_dir_present", "docs_index_present", "adr_present", "contributing_present", "doc_file_count", "doc_to_source_file_ratio"],
+          "properties": {
+            "readme_present": { "type": "boolean" },
+            "readme_bytes": { "type": "integer", "minimum": 0 },
+            "docs_dir_present": { "type": "boolean" },
+            "docs_index_present": { "type": "boolean" },
+            "adr_present": { "type": "boolean" },
+            "contributing_present": { "type": "boolean" },
+            "doc_file_count": { "type": "integer", "minimum": 0 },
+            "doc_to_source_file_ratio": { "type": "number", "minimum": 0 }
+          }
+        },
+        "testing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["test_file_count", "source_file_count", "test_to_source_ratio", "test_framework_config_present", "test_dir_present"],
+          "properties": {
+            "test_file_count": { "type": "integer", "minimum": 0 },
+            "source_file_count": { "type": "integer", "minimum": 0 },
+            "test_to_source_ratio": { "type": "number", "minimum": 0 },
+            "test_framework_config_present": { "type": "boolean" },
+            "test_dir_present": { "type": "boolean" }
+          }
+        },
+        "ci_automation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ci_workflow_count", "ci_present", "ci_runs_tests", "precommit_present", "task_runner_quality_targets"],
+          "properties": {
+            "ci_workflow_count": { "type": "integer", "minimum": 0 },
+            "ci_present": { "type": "boolean" },
+            "ci_runs_tests": { "type": "boolean" },
+            "precommit_present": { "type": "boolean" },
+            "task_runner_quality_targets": { "type": "boolean" }
+          }
+        },
+        "type_safety": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type_config_present", "strict_mode", "typed_ratio", "statically_typed_language", "linter_config_present", "formatter_config_present"],
+          "properties": {
+            "type_config_present": { "type": "boolean" },
+            "strict_mode": { "type": "boolean" },
+            "typed_ratio": { "$ref": "#/$defs/share01" },
+            "statically_typed_language": { "type": "boolean" },
+            "linter_config_present": { "type": "boolean" },
+            "formatter_config_present": { "type": "boolean" }
+          }
+        },
+        "dependency_hygiene": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["manifest_present", "manifest_count", "lockfile_present", "lockfile_count", "update_automation_present", "security_policy_present", "pinned_deps"],
+          "properties": {
+            "manifest_present": { "type": "boolean" },
+            "manifest_count": { "type": "integer", "minimum": 0 },
+            "lockfile_present": { "type": "boolean" },
+            "lockfile_count": { "type": "integer", "minimum": 0 },
+            "update_automation_present": { "type": "boolean" },
+            "security_policy_present": { "type": "boolean" },
+            "pinned_deps": { "type": "boolean" }
+          }
+        },
+        "security_posture": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["secret_match_count", "secret_scan_unconfident_files", "files_secret_scanned", "secret_scan_truncated", "gitignore_covers_env", "env_example_present", "committed_env_present", "env_check_via_git"],
+          "properties": {
+            "secret_match_count": { "type": "integer", "minimum": 0 },
+            "secret_scan_unconfident_files": { "type": "integer", "minimum": 0 },
+            "files_secret_scanned": { "type": "integer", "minimum": 0 },
+            "secret_scan_truncated": { "type": "boolean" },
+            "gitignore_covers_env": { "type": "boolean" },
+            "env_example_present": { "type": "boolean" },
+            "committed_env_present": { "type": "boolean" },
+            "env_check_via_git": { "type": "boolean" }
+          }
+        },
+        "modularity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source_file_count", "source_dir_count", "top_level_dir_count", "max_dir_depth", "largest_file_loc", "files_over_500_loc_ratio", "avg_file_loc"],
+          "properties": {
+            "source_file_count": { "type": "integer", "minimum": 0 },
+            "source_dir_count": { "type": "integer", "minimum": 0 },
+            "top_level_dir_count": { "type": "integer", "minimum": 0 },
+            "max_dir_depth": { "type": "integer", "minimum": 0 },
+            "largest_file_loc": { "type": "integer", "minimum": 0 },
+            "files_over_500_loc_ratio": { "$ref": "#/$defs/share01" },
+            "avg_file_loc": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "architecture": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["top_level_dir_count", "source_dir_count", "source_file_count", "layer_dir_signal_count", "monorepo_markers_present"],
+          "properties": {
+            "top_level_dir_count": { "type": "integer", "minimum": 0 },
+            "source_dir_count": { "type": "integer", "minimum": 0 },
+            "source_file_count": { "type": "integer", "minimum": 0 },
+            "layer_dir_signal_count": { "type": "integer", "minimum": 0 },
+            "monorepo_markers_present": { "type": "boolean" }
+          }
+        },
+        "maintainability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["todo_fixme_count", "todo_per_kloc", "files_over_400_loc_ratio", "avg_file_loc", "dead_code_hint_count", "duplicate_candidate_count", "churn_available", "churn_total_lines", "churn_files_touched", "churn_top10_share"],
+          "properties": {
+            "todo_fixme_count": { "type": "integer", "minimum": 0 },
+            "todo_per_kloc": { "type": "number", "minimum": 0 },
+            "files_over_400_loc_ratio": { "$ref": "#/$defs/share01" },
+            "avg_file_loc": { "type": "integer", "minimum": 0 },
+            "dead_code_hint_count": { "type": "integer", "minimum": 0 },
+            "duplicate_candidate_count": { "type": "integer", "minimum": 0 },
+            "churn_available": { "type": "boolean" },
+            "churn_total_lines": { "type": "integer", "minimum": 0 },
+            "churn_files_touched": { "type": "integer", "minimum": 0 },
+            "churn_top10_share": { "$ref": "#/$defs/share01" }
+          }
+        },
+        "release_ops": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["changelog_present", "version_marker_present", "git_tag_count", "container_present", "orchestration_present", "env_contract_present", "healthcheck_signal", "observability_signal"],
+          "properties": {
+            "changelog_present": { "type": "boolean" },
+            "version_marker_present": { "type": "boolean" },
+            "git_tag_count": { "type": "integer", "minimum": 0 },
+            "container_present": { "type": "boolean" },
+            "orchestration_present": { "type": "boolean" },
+            "env_contract_present": { "type": "boolean" },
+            "healthcheck_signal": { "type": "boolean" },
+            "observability_signal": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "repoScorecard": {
+      "description": "One explicitly user-selected, locally scanned repository. repo_ref is minted with the SAME salted opaque-ref mechanism as every other ref: truncated (24 hex chars) SHA-256 of salt ‖ 'repo' ‖ absolute-repo-path, NUL-joined, where salt = SHA-256('viber-local-v1' ‖ selected-project-path ‖ home-dir) — never a repo name, path, or remote. quality/coverage/overall/grade follow the pinned repo_rubric.md §4 math (quality = mean score over status=='scored' dims, round2 for transport; coverage = scored_count/10 exact; overall = round(unrounded_quality * (0.5 + 0.5 * coverage)) clamped 0-100; grade per the overall_grade band table). All are advisory display hints recomputable from the integer dimension scores. Self-reported; server re-verification is a later slice.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo_ref", "primary_language", "size_band", "quality", "coverage", "overall", "grade", "dimensions", "markers"],
+      "properties": {
+        "repo_ref": { "$ref": "#/$defs/opaqueRef" },
+        "primary_language": {
+          "enum": ["typescript", "javascript", "python", "go", "rust", "ruby", "java", "other", "unknown"]
+        },
+        "size_band": {
+          "enum": ["tiny", "small", "medium", "large", "very_large"]
+        },
+        "quality": { "type": "number", "minimum": 0, "maximum": 100 },
+        "coverage": { "$ref": "#/$defs/share01" },
+        "overall": { "$ref": "#/$defs/score0to100" },
+        "grade": {
+          "enum": ["exceptional", "strong", "proficient", "developing", "emerging"]
+        },
+        "dimensions": {
+          "description": "All 10 fixed repo_rubric dimension keys are REQUIRED, in every scorecard — a key is never dropped (NA-strict: status 'na' instead).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["documentation", "testing", "ci_automation", "type_safety", "dependency_hygiene", "security_posture", "modularity", "architecture", "maintainability", "release_ops"],
+          "properties": {
+            "documentation": { "$ref": "#/$defs/repoDimension" },
+            "testing": { "$ref": "#/$defs/repoDimension" },
+            "ci_automation": { "$ref": "#/$defs/repoDimension" },
+            "type_safety": { "$ref": "#/$defs/repoDimension" },
+            "dependency_hygiene": { "$ref": "#/$defs/repoDimension" },
+            "security_posture": { "$ref": "#/$defs/repoDimension" },
+            "modularity": { "$ref": "#/$defs/repoDimension" },
+            "architecture": { "$ref": "#/$defs/repoDimension" },
+            "maintainability": { "$ref": "#/$defs/repoMaintainabilityDimension" },
+            "release_ops": { "$ref": "#/$defs/repoDimension" }
+          }
+        },
+        "markers": { "$ref": "#/$defs/repoMarkers" },
+        "notes": {
+          "description": "At most two OPTIONAL paraphrased narrative notes — the ONLY free text in the repo block: the host agent's architecture judgment rationale and maintainability refinement rationale. Both pass BOTH redaction layers (and public-dj's independent re-scrub): no paths, file/repo/org names, identifiers, secrets, or code.",
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "architecture": { "type": "string", "maxLength": 400 },
+            "maintainability": { "type": "string", "maxLength": 400 }
+          }
+        }
+      }
+    },
+    "repoPortfolio": {
+      "description": "Portfolio rollup over scorecards (repo_rubric.md §5) — advisory display hints fully recomputable from the scorecards. The richer §5 fields (per-dimension best, language share mix) are intentionally NOT duplicated here: they are display-derivable from the submitted scorecards.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo_count", "mean_overall", "mean_coverage", "by_dimension", "primary_languages"],
+      "properties": {
+        "repo_count": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "mean_overall": { "$ref": "#/$defs/score0to100" },
+        "mean_coverage": { "$ref": "#/$defs/share01" },
+        "by_dimension": {
+          "description": "All 10 repo_rubric dimension keys are REQUIRED (NA-strict at the portfolio level too: a key is never dropped).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["documentation", "testing", "ci_automation", "type_safety", "dependency_hygiene", "security_posture", "modularity", "architecture", "maintainability", "release_ops"],
+          "properties": {
+            "documentation": { "$ref": "#/$defs/repoMeanOrNa" },
+            "testing": { "$ref": "#/$defs/repoMeanOrNa" },
+            "ci_automation": { "$ref": "#/$defs/repoMeanOrNa" },
+            "type_safety": { "$ref": "#/$defs/repoMeanOrNa" },
+            "dependency_hygiene": { "$ref": "#/$defs/repoMeanOrNa" },
+            "security_posture": { "$ref": "#/$defs/repoMeanOrNa" },
+            "modularity": { "$ref": "#/$defs/repoMeanOrNa" },
+            "architecture": { "$ref": "#/$defs/repoMeanOrNa" },
+            "maintainability": { "$ref": "#/$defs/repoMeanOrNa" },
+            "release_ops": { "$ref": "#/$defs/repoMeanOrNa" }
+          }
+        },
+        "primary_languages": {
+          "description": "Deduplicated primary_language values across scorecards, in first-seen scorecard order.",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 9,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["typescript", "javascript", "python", "go", "rust", "ruby", "java", "other", "unknown"]
+          }
+        }
+      }
+    },
+    "repoMeanOrNa": {
+      "description": "Rounded mean score over the scorecards where this dimension has status 'scored', or the literal string 'na' when no scanned repo scored it. Self-bounding type union: numbers are clamped 0-100 (minimum/maximum apply to the number branch), and the only legal string is 'na' (pattern applies to the string branch).",
+      "type": ["number", "string"],
+      "minimum": 0,
+      "maximum": 100,
+      "pattern": "^na$"
     }
   }
 }

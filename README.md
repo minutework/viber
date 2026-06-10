@@ -8,7 +8,10 @@ credential powers [Vibexp](https://vibexp.dev) builder profiles and leaderboards
 curl -fsSL https://profile.vibexp.com/upload.sh | bash
 ```
 
-Run it from the project root you want to profile, or pass `--project /path/to/project`.
+Run it from the project root you want to profile, or pass `--project /path/to/project`. To opt
+extra repositories into the structural repo-architecture scorecard, add `--repo <path>`
+(repeatable) or `--repos /path/a,/path/b`, or pick from the interactive prompt on a terminal —
+repos are **never** auto-enumerated; only what you explicitly select is scanned.
 
 ## How it works (and why you can trust it)
 
@@ -17,7 +20,10 @@ The bootstrap launches your agent (Claude / Codex / Cursor) pointed at an open s
 analyzes your transcripts **locally**, and the **only** thing transmitted is one schema-valid
 **profile JSON**. Raw transcripts, source code, file paths, and your working tree **never leave your
 machine**. You can read every line, watch it work, and `--dry-run` to print the exact payload before
-anything is sent.
+anything is sent. Opt-in repo scans are local too: a repo scorecard carries only **numbers,
+booleans, enums, and a salted opaque ref** plus at most two paraphrased, redaction-backstopped
+notes — repos are identified by primary language + size band, never by name, path, or remote, and
+the local secret scan ships a **count only**, never values or locations.
 
 Sign-in uses a **PKCE GitHub-OAuth loopback handoff** against the shared platform
 (`VIBER_PLATFORM_BASE_URL`): the bootstrap generates a PKCE verifier locally, opens your browser to
@@ -41,13 +47,14 @@ written to `~/.vibexp/refresh/credential` only if you opt into the living-profil
 |---|---|
 | [`schema/profile.schema.json`](schema/profile.schema.json) | The frozen hard allowlist — the only thing submitted. |
 | [`skill/rubric.md`](skill/rubric.md) | The versioned, open scoring rubric (8 dimensions + calibration). |
+| [`skill/repo_rubric.md`](skill/repo_rubric.md) | The separate repo-architecture rubric (10 structural dimensions for opt-in repo scorecards). |
 | `skill/SKILL.md` | The multi-agent analysis instructions (orchestrator / worker / synthesizer / validator). |
-| `mcp/` | The local MCP server (`submit_profile`, `analysis_manifest`) — open so you see exactly what is sent. |
+| `mcp/` | The local MCP server (`submit_profile`, `analysis_manifest`, plus local-only analysis helpers incl. `analyze_repo_architecture`) — open so you see exactly what is sent. |
 | `upload.sh` | The download-then-exec bootstrap (detect agent, authorize, run, submit). |
 | [`docs/data-handling.md`](docs/data-handling.md) | Exactly what does and does not leave your machine. |
 
-**Contract:** schema `1.1.0` / rubric `1.1.0`; public-dj may dual-accept older verified snapshots
-through its compatibility map.
+**Contract:** schema `1.2.0` / rubric `1.1.0` / repo_rubric `1.0.0` (decoupled since 1.1.0;
+public-dj dual-accepts older verified snapshots through its server-side compatibility map).
 
 ## Status
 
@@ -124,3 +131,9 @@ curl -fsSL https://profile.vibexp.com/upload.sh | bash -s -- --schedule-uninstal
 
 Config lives at `~/.vibexp/refresh/config`; set `VIBER_REFRESH_DISABLED=1`
 for a temporary off-switch.
+
+The repo-scorecard selection persists there too, as `VIBER_ARCH_REPOS`
+(colon-separated absolute paths); nightly refreshes rescan the same
+explicitly selected set — directories that no longer exist are skipped with
+a warning. Change the set by editing that line, or by re-running the
+bootstrap with `--schedule-only --repos /path/a,/path/b`.

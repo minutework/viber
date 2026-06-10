@@ -1,6 +1,7 @@
 # Data handling — exactly what leaves your machine
 
-**Contract version:** schema `1.1.0` / rubric `1.1.0`
+**Contract version:** schema `1.2.0` / rubric `1.1.0` / repo_rubric `1.0.0` (decoupled; accepted
+pairings are enforced by public-dj's server-side compatibility map).
 
 viber analyzes your coding-agent transcripts **locally, inside your own agent, on your own
 subscription**. The only thing transmitted is a single schema-valid **profile JSON** (the shape in
@@ -13,11 +14,11 @@ whole submission.
 This tool is **open source** and runs in **your** agent — you can read every line, watch it work,
 and diff the exact payload with `--dry-run` before anything is sent.
 
-The bundled MCP server also provides local-only discovery helpers:
-`discover_local_sources()`, `build_actual_metrics()`, `build_episode_candidates()`, and
-`git_aggregate_metrics()`. These
-helpers read Claude/Codex/Cursor transcript stores and host-side git metadata for the selected
-project, but send nothing over the network. Cursor extraction uses `sqlite3` against Cursor's
+The bundled MCP server also provides local-only analysis helpers: `discover_local_sources()`,
+`build_actual_metrics()`, `build_episode_candidates()`, `build_wrapped_aggregates()`,
+`git_aggregate_metrics()`, and `analyze_repo_architecture()` — all local-only; they read
+transcript stores, host-side git metadata, and (for explicitly selected repos) repository
+structure, and send nothing over the network. Cursor extraction uses `sqlite3` against Cursor's
 `state.vscdb` in read-only immutable mode and only counts project-scoped rows.
 
 ---
@@ -48,6 +49,7 @@ client telemetry.
 | Code-quality signals | floats 0–1, counts | Behavioral inference, never code. |
 | Client telemetry | OS **family**, durations, pattern-bounded versions | `darwin`/`linux`/`windows` only. |
 | Redaction report | two `applied: true` flags + counts | Advisory; public-dj re-verifies independently and unconditionally. |
+| Repo architecture scorecards (opt-in) | per-repo numbers/booleans/enums + salted hex `repo_ref` + ≤2 paraphrased ≤400-char notes | Only for repos you explicitly selected (`--repo`/`--repos`/interactive picker). Repos identified by primary language + size band, never name/path. The secret scan ships a COUNT only. Self-reported; server re-verification is a later slice. |
 
 ## What NEVER leaves your machine
 
@@ -59,7 +61,7 @@ client telemetry.
 | Class / function / variable / module **identifiers** | Layer-2 redactor strips them; excerpts are paraphrased. |
 | **Author email / author name / git identity** | Never uploaded. Only **aggregate** commit stats. |
 | Secrets, API keys, tokens, JWTs, PEM keys, DB URLs with creds | Layer-1 secret scrubber, fail-closed. |
-| Other repos, remotes, org names | **Project-scoped only.** The skill analyzes the one chosen project and never enumerates, catalogs, or transmits other repos/remotes/orgs. `repos_considered` is asserted `== 1`. |
+| Other repos, remotes, org names | **Transcript analysis is project-scoped** (`repos_considered == 1`): the skill analyzes one chosen project's transcripts and never enumerates other repos/remotes/orgs on its own. Structural repo SCANS are a separate, explicit opt-in per repo; even for opted-in repos, names, paths, remotes, and orgs never leave — a scorecard carries only numbers, booleans, enums, and a salted hex ref. |
 | `~/.ssh`, `~/.aws`, keychains, env files, the docker socket | Out of scope; the analyzer reads only agent-transcript locations + host-side `git`. |
 | A second persisted copy of your raw data | Raw working files are **ephemeral** and purged on completion. The persistent `~/.vibexp/cache/<project_digest>/` stores only salted request digests, extractor/version stamps, redacted derived aggregates, and score nonce replay data. No raw transcripts, source code, paths, filenames, repo names, hashes, emails, refresh credentials, or submission tokens. |
 
@@ -154,6 +156,34 @@ histogram, or a salted opaque ref; **no new free-text fields were added**. Speci
 - `client_telemetry.classifier_version` — the versioned command-classifier behind the test/build
   classification rates, for reproducibility.
 
+## Schema 1.2.0 additions (repo architecture scorecards)
+
+Schema 1.2.0 adds an OPTIONAL `repo_architecture` block plus an advisory `combined_score` /
+`combined_grade` headline (client display hints; a later public-dj slice recomputes them
+server-side). It is a **consented, multi-repo structural showcase**: scorecards for repositories
+you **explicitly selected** (`--repo` / `--repos` / the interactive picker), scored under the
+separate [`skill/repo_rubric.md`](../skill/repo_rubric.md) (repo_rubric `1.0.0`). It is entirely
+separate from — and changes nothing about — the single-project session privacy contract above:
+`repos_considered == 1` still attests that **transcript** analysis covered exactly one project.
+
+- Every scorecard field is a **number, boolean, pinned enum, or salted hex opaque `repo_ref`** —
+  except at most two OPTIONAL paraphrased notes per repo (architecture and maintainability
+  rationale, ≤400 chars each) that pass the **same double redaction** as every excerpt field.
+- Repos are identified by **primary language + size band + the opaque ref only** — never by name,
+  path, remote, or org.
+- The scanner's deterministic markers ship verbatim (counts, ratios, booleans). Its local secret
+  scan contributes a **count only** — never secret values or locations.
+- The scan's `local_only` block (candidate file paths, top-level dirs, largest/most-churned/TODO
+  files) is a local judging input for the agent and **never ships** — no schema field accepts it.
+- Multi-repo enumeration is **explicit opt-in**: with no `--repo`/`--repos` flags and no
+  interactive selection, only the already-consented selected project is scanned, and the tool
+  never discovers or scans a repo you did not list.
+- Scorecards are self-reported by the open-source client; server-side re-verification of repo
+  scans is a later slice. The session-scoring integrity path (proxy nonces, server recomputation)
+  is unchanged.
+
 The verbatim-quote insights (cryptic prompt, crash-out quote, go-to phrase) remain EXCLUDED: only
-their numeric counts ship. Any future verbatim tier requires a schema 1.2.0 consent object, per-quote
-approval, and an explicit amendment to this document.
+their numeric counts ship. Any future verbatim tier requires a future schema (1.3.0 or later)
+consent object, per-quote approval, and an explicit amendment to this document — the 1.2.0
+repo-architecture block does not consume that reservation and adds no verbatim transcript or
+source content.
