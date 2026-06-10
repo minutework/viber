@@ -70,6 +70,7 @@ NO_SCHEDULE=0
 NON_INTERACTIVE=0
 METRICS_REFRESH=0
 PROJECT_PATH=""
+ARCH_REPO_ARGS=()
 
 print_usage() {
   cat <<'USAGE'
@@ -78,6 +79,8 @@ vibexp bootstrap
 Options:
   --agent <claude|codex|cursor>  Force a specific agent (else auto-pick a logged-in one).
   --project <path>                Project root to analyze/schedule (default: current directory).
+  --repo <path>                  Also scan <path> for the repo-architecture scorecard (repeatable).
+  --repos <p1,p2,...>            Comma-separated list of additional repos to scan.
   --dry-run                      Agent prints the exact payload and sends NOTHING.
   --metrics-refresh              Refresh deterministic metrics only; no AI agent.
   --schedule                     After this run, install the living-profile refresh.
@@ -92,7 +95,7 @@ Environment overrides:
   VIBER_OAUTH_START_URL, VIBER_TOKEN_EXCHANGE_URL,
   VIBER_SCORE_HEALTH_URL, VIBER_METRICS_REFRESH_URL,
   VIBER_SKILL_URL, VIBER_MCP_PACKAGE, VIBER_LOOPBACK_PORT,
-  VIBER_CURSOR_MODEL
+  VIBER_CURSOR_MODEL, VIBER_ARCH_REPOS
 USAGE
 }
 
@@ -125,6 +128,42 @@ while [ "$#" -gt 0 ]; do
       ;;
     --project=*)
       PROJECT_PATH="${1#*=}"
+      shift
+      ;;
+    --repo)
+      if [ "$#" -lt 2 ]; then
+        printf 'vibexp: --repo requires a path\n' >&2
+        print_usage >&2
+        exit 2
+      fi
+      ARCH_REPO_ARGS+=("${2:-}")
+      shift 2
+      ;;
+    --repo=*)
+      ARCH_REPO_ARGS+=("${1#*=}")
+      shift
+      ;;
+    --repos)
+      if [ "$#" -lt 2 ]; then
+        printf 'vibexp: --repos requires a comma-separated list of paths\n' >&2
+        print_usage >&2
+        exit 2
+      fi
+      IFS=',' read -r -a REPOS_SPLIT <<<"${2:-}"
+      for repo_entry in ${REPOS_SPLIT[@]+"${REPOS_SPLIT[@]}"}; do
+        if [ -n "$repo_entry" ]; then
+          ARCH_REPO_ARGS+=("$repo_entry")
+        fi
+      done
+      shift 2
+      ;;
+    --repos=*)
+      IFS=',' read -r -a REPOS_SPLIT <<<"${1#*=}"
+      for repo_entry in ${REPOS_SPLIT[@]+"${REPOS_SPLIT[@]}"}; do
+        if [ -n "$repo_entry" ]; then
+          ARCH_REPO_ARGS+=("$repo_entry")
+        fi
+      done
       shift
       ;;
     --schedule)
@@ -173,6 +212,180 @@ resolve_project_path() {
 }
 
 SELECTED_PROJECT_PATH="$(resolve_project_path "$PROJECT_PATH")"
+
+# --------------------------------------------------------------------------- #
+# Repo-architecture scorecards — explicit multi-repo opt-in (schema 1.2.0)
+# --------------------------------------------------------------------------- #
+# Resolves which repos the agent may structurally scan (SKILL.md repo-scorecard
+# section) and exports the set as VIBER_ARCH_REPOS: colon-separated CANONICAL
+# absolute paths. Precedence: --repo/--repos flags > a pre-set VIBER_ARCH_REPOS
+# (scheduled runs source it from ~/.vibexp/refresh/config) > interactive picker
+# (controlling tty only) > the selected project alone — exactly the historical
+# single-project behavior. Scans are local; a scorecard ships only numbers,
+# booleans, enums, and salted opaque refs (plus two paraphrased notes) —
+# never a repo name, path, or remote.
+
+ARCH_REPOS=()
+
+arch_warn() { printf 'vibexp: WARNING: %s\n' "$*" >&2; }
+
+# Canonicalize a candidate repo dir (cd && pwd -P); fails when not a directory.
+arch_canon_dir() {
+  local candidate="${1:-}"
+  if [ -z "$candidate" ] || [ ! -d "$candidate" ]; then
+    return 1
+  fi
+  (cd "$candidate" 2>/dev/null && pwd -P)
+}
+
+# Append a CANONICAL path to ARCH_REPOS (order-preserving dedup). ':' is the
+# VIBER_ARCH_REPOS list separator, so paths containing it cannot be encoded
+# unambiguously and are dropped with a warning.
+arch_add_repo() {
+  local path="$1" existing
+  case "$path" in
+    *:*)
+      arch_warn "skipping repo with ':' in path: $path"
+      return 0
+      ;;
+  esac
+  for existing in ${ARCH_REPOS[@]+"${ARCH_REPOS[@]}"}; do
+    if [ "$existing" = "$path" ]; then
+      return 0
+    fi
+  done
+  ARCH_REPOS+=("$path")
+}
+
+# Canonicalize/validate one user-supplied entry, then add it.
+arch_add_candidate() {
+  local raw="$1" canon=""
+  if canon="$(arch_canon_dir "$raw")"; then
+    arch_add_repo "$canon"
+  else
+    arch_warn "skipping repo (not a directory): $raw"
+  fi
+}
+
+# Interactive picker: the selected project is always scanned; offer immediate
+# child + sibling git repos (bounded discovery, one level each). All prompt
+# I/O goes via the controlling tty (`curl | bash` leaves stdin on the pipe).
+arch_offer_picker() {
+  arch_add_repo "$SELECTED_PROJECT_PATH"
+  local candidates=() overflow=0
+  local parent_dir candidate base canon existing seen index
+  parent_dir="$(dirname "$SELECTED_PROJECT_PATH")"
+  for candidate in "$SELECTED_PROJECT_PATH"/*/ "$parent_dir"/*/; do
+    [ -d "$candidate" ] || continue
+    base="$(basename "$candidate")"
+    case "$base" in .*) continue ;; esac
+    # .git may be a dir OR a file (worktrees / submodules).
+    [ -e "${candidate%/}/.git" ] || continue
+    canon="$(arch_canon_dir "$candidate")" || continue
+    [ "$canon" = "$SELECTED_PROJECT_PATH" ] && continue
+    case "$canon" in *:*) continue ;; esac
+    seen=0
+    for existing in ${candidates[@]+"${candidates[@]}"}; do
+      if [ "$existing" = "$canon" ]; then
+        seen=1
+        break
+      fi
+    done
+    [ "$seen" -eq 1 ] && continue
+    if [ "${#candidates[@]}" -ge 15 ]; then
+      overflow=1
+      continue
+    fi
+    candidates+=("$canon")
+  done
+  if [ "${#candidates[@]}" -eq 0 ]; then
+    return 0
+  fi
+  {
+    printf 'vibexp: structural repo scorecard — the selected project is always scanned:\n'
+    printf '  [1] %s   (selected project)\n' "$SELECTED_PROJECT_PATH"
+    printf 'vibexp: additional local git repos found next to it:\n'
+    index=2
+    for canon in "${candidates[@]}"; do
+      printf '  [%d] %s\n' "$index" "$canon"
+      index=$((index + 1))
+    done
+    if [ "$overflow" -eq 1 ]; then
+      printf 'vibexp: ...more repos not shown — pass --repo/--repos to add others.\n'
+    fi
+    printf 'vibexp: also scan additional repos? Enter numbers (e.g. "2 3"), "a" for all, or press Enter for none: '
+  } >/dev/tty
+  local answer=""
+  read -r answer </dev/tty || answer=""
+  case "$answer" in
+    "") return 0 ;;
+    a | A | all | ALL)
+      for canon in "${candidates[@]}"; do
+        arch_add_repo "$canon"
+      done
+      ;;
+    *)
+      local token
+      for token in $answer; do
+        case "$token" in
+          *[!0-9]*)
+            arch_warn "ignoring selection: $token"
+            ;;
+          *)
+            if [ "$token" -ge 2 ] && [ "$token" -le $((${#candidates[@]} + 1)) ]; then
+              arch_add_repo "${candidates[$((token - 2))]}"
+            else
+              arch_warn "ignoring out-of-range selection: $token"
+            fi
+            ;;
+        esac
+      done
+      ;;
+  esac
+}
+
+if [ "$SCHEDULE_UNINSTALL" -ne 1 ]; then
+  if [ "${#ARCH_REPO_ARGS[@]}" -gt 0 ]; then
+    # 1. Explicit flags: the selected project first, then each flag path
+    #    (canonicalized + validated; dedup preserves order).
+    arch_add_repo "$SELECTED_PROJECT_PATH"
+    for arch_entry in "${ARCH_REPO_ARGS[@]}"; do
+      arch_add_candidate "$arch_entry"
+    done
+  elif [ -n "${VIBER_ARCH_REPOS:-}" ]; then
+    # 2. Pre-set env (scheduled refresh config / power users): the persisted
+    #    set is authoritative — validate entries, do NOT force-add the project.
+    IFS=':' read -r -a ARCH_ENV_ENTRIES <<<"$VIBER_ARCH_REPOS"
+    for arch_entry in ${ARCH_ENV_ENTRIES[@]+"${ARCH_ENV_ENTRIES[@]}"}; do
+      if [ -n "$arch_entry" ]; then
+        arch_add_candidate "$arch_entry"
+      fi
+    done
+  elif [ "$NON_INTERACTIVE" -eq 0 ] && [ "$SCHEDULE_ONLY" -eq 0 ] &&
+    [ "${VIBER_ARCH_NO_PROMPT:-0}" != "1" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    # 3. Interactive multi-select via the controlling tty.
+    arch_offer_picker
+  else
+    # 4. Default: exactly the historical single-project behavior.
+    arch_add_repo "$SELECTED_PROJECT_PATH"
+  fi
+
+  # Schema bound: at most 20 scorecards per profile.
+  if [ "${#ARCH_REPOS[@]}" -gt 20 ]; then
+    arch_warn "more than 20 repos selected; keeping the first 20 (schema bound)."
+    ARCH_REPOS=("${ARCH_REPOS[@]:0:20}")
+  fi
+
+  if [ "${#ARCH_REPOS[@]}" -gt 0 ]; then
+    VIBER_ARCH_REPOS="$(
+      IFS=:
+      printf '%s' "${ARCH_REPOS[*]}"
+    )"
+  else
+    VIBER_ARCH_REPOS=""
+  fi
+  export VIBER_ARCH_REPOS
+fi
 
 # --------------------------------------------------------------------------- #
 # Living profile — self-installing hourly/weekly refresh (works from `curl | bash`)
@@ -409,6 +622,7 @@ write_refresh_config() {
   cat >"$config" <<EOF
 # Vibexp living-profile refresh config (sourced by ~/.vibexp/bin/vibexp-refresh).
 VIBER_REFRESH_PROJECT_PATH="$SELECTED_PROJECT_PATH"
+VIBER_ARCH_REPOS="$VIBER_ARCH_REPOS"
 VIBER_BASE_URL="$VIBER_BASE_URL"
 VIBER_PUBLIC_DJ_BASE_URL="$VIBER_PUBLIC_DJ_BASE_URL"
 VIBER_PLATFORM_BASE_URL="$VIBER_PLATFORM_BASE_URL"
@@ -1542,6 +1756,9 @@ fi
 if [ -n "${VIBER_PROMPT_APPEND:-}" ]; then
   PROMPT="${PROMPT} ${VIBER_PROMPT_APPEND}"
 fi
+if [ -n "${VIBER_ARCH_REPOS:-}" ]; then
+  PROMPT="${PROMPT} The user explicitly selected these repositories for local structural scans (colon-separated; also exported as VIBER_ARCH_REPOS): ${VIBER_ARCH_REPOS}. Follow SKILL.md section 7: scan each with the viber-mcp analyze_repo_architecture tool, judge dimensions 8-9 locally per skill/repo_rubric.md, and attach repo_architecture scorecards when ready. A failed scan must not block submission."
+fi
 
 # MCP server launch command (stdio). Agents that accept inline MCP config use this.
 MCP_CMD="npx -y ${VIBER_MCP_PACKAGE} viber-mcp"
@@ -1573,11 +1790,21 @@ JSON
       CLAUDE_ADD_DIR_ARGS+=(--add-dir "$transcript_dir")
     fi
   done
+  # Per-repo read access for the opt-in structural scans (the invocation
+  # directory itself needs no --add-dir; default runs add zero new args).
+  if [ -n "${VIBER_ARCH_REPOS:-}" ]; then
+    IFS=':' read -r -a CLAUDE_ARCH_DIRS <<<"$VIBER_ARCH_REPOS"
+    for arch_dir in ${CLAUDE_ARCH_DIRS[@]+"${CLAUDE_ARCH_DIRS[@]}"}; do
+      if [ -n "$arch_dir" ] && [ -d "$arch_dir" ] && [ "$arch_dir" != "$PWD" ]; then
+        CLAUDE_ADD_DIR_ARGS+=(--add-dir "$arch_dir")
+      fi
+    done
+  fi
 
   run_with_heartbeat "Claude profile generation" \
     claude -p "$PROMPT" \
     --permission-mode auto \
-    --allowedTools "Read,Glob,Grep,LS,Bash,mcp__viber__analysis_manifest,mcp__viber__discover_local_sources,mcp__viber__build_actual_metrics,mcp__viber__build_episode_candidates,mcp__viber__git_aggregate_metrics,mcp__viber__score_episodes,mcp__viber__submit_profile" \
+    --allowedTools "Read,Glob,Grep,LS,Bash,mcp__viber__analysis_manifest,mcp__viber__discover_local_sources,mcp__viber__build_actual_metrics,mcp__viber__build_episode_candidates,mcp__viber__git_aggregate_metrics,mcp__viber__score_episodes,mcp__viber__submit_profile,mcp__viber__build_wrapped_aggregates,mcp__viber__analyze_repo_architecture" \
     --disallowedTools "Agent,Edit,Write,MultiEdit,NotebookEdit" \
     --mcp-config "$MCP_CFG" \
     --strict-mcp-config \
@@ -1590,11 +1817,30 @@ run_codex() {
   CODEX_MCP_WRAPPER="${SCRATCH}/codex-viber-mcp"
   write_viber_mcp_wrapper "$CODEX_MCP_WRAPPER"
 
+  # Per-repo read access for the opt-in structural scans (the invocation
+  # directory itself needs no --add-dir; default runs add zero new args).
+  CODEX_ADD_DIR_ARGS=()
+  if [ -n "${VIBER_ARCH_REPOS:-}" ]; then
+    IFS=':' read -r -a CODEX_ARCH_DIRS <<<"$VIBER_ARCH_REPOS"
+    for arch_dir in ${CODEX_ARCH_DIRS[@]+"${CODEX_ARCH_DIRS[@]}"}; do
+      if [ -n "$arch_dir" ] && [ -d "$arch_dir" ] && [ "$arch_dir" != "$PWD" ]; then
+        CODEX_ADD_DIR_ARGS+=(--add-dir "$arch_dir")
+      fi
+    done
+  fi
+
   if "$CODEX_BIN" exec --help 2>/dev/null | grep -q -- "--mcp-server"; then
+    # Mirror the --mcp-server help probe: only pass --add-dir on this fast
+    # path when the installed codex build advertises it.
+    CODEX_FAST_ADD_DIR_ARGS=()
+    if [ "${#CODEX_ADD_DIR_ARGS[@]}" -gt 0 ] && "$CODEX_BIN" exec --help 2>/dev/null | grep -q -- "--add-dir"; then
+      CODEX_FAST_ADD_DIR_ARGS=("${CODEX_ADD_DIR_ARGS[@]}")
+    fi
     run_with_heartbeat "Codex profile generation" \
       "$CODEX_BIN" exec \
       --sandbox read-only \
       --mcp-server "viber=${CODEX_MCP_WRAPPER}" \
+      ${CODEX_FAST_ADD_DIR_ARGS[@]+"${CODEX_FAST_ADD_DIR_ARGS[@]}"} \
       "$PROMPT"
     return
   fi
@@ -1612,6 +1858,7 @@ run_codex() {
     build_wrapped_aggregates \
     build_episode_candidates \
     git_aggregate_metrics \
+    analyze_repo_architecture \
     score_episodes \
     submit_profile
   do
@@ -1622,6 +1869,7 @@ run_codex() {
     "$CODEX_BIN" exec \
     --sandbox read-only \
     --add-dir "$SKILL_DIR" \
+    ${CODEX_ADD_DIR_ARGS[@]+"${CODEX_ADD_DIR_ARGS[@]}"} \
     "${CODEX_MCP_CONFIG_ARGS[@]}" \
     "$PROMPT"
 }

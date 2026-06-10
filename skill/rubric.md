@@ -1,8 +1,10 @@
 # Verifiable AI-Builder Rubric
 
-**rubric_version: 1.1.0** · pairs with `schema_version: 1.1.0` (`schema/profile.schema.json`).
-public-dj's compatibility map governs accepted pairings (1.1.0 schema accepts rubric 1.0.0 or
-1.1.0); §1–§5 are unchanged from 1.0.0, so 1.0.0 scores remain comparable. §6–§8 are new.
+**rubric_version: 1.1.0** · pairs with `schema_version: 1.2.0` (`schema/profile.schema.json`).
+public-dj's compatibility map governs accepted pairings (the 1.1.0 and 1.2.0 schemas each accept
+rubric 1.0.0 or 1.1.0); §1–§5 are unchanged from 1.0.0, so 1.0.0 scores remain comparable. §6–§8
+are new. Repo scorecards are governed by the separate `skill/repo_rubric.md`
+(repo_rubric_version 1.0.0), not by this rubric.
 
 This rubric is fixed, versioned, and open so that scoring is consistent and auditable across
 developers, agents, and runs. It is reimplemented independently from first principles; it is not
