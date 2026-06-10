@@ -301,3 +301,113 @@ export function detectViolations(input: string): string[] {
   }
   return violations;
 }
+
+/* ------------------------------------------------------------------ *
+ * shipped_with_ai carve-out (schema 1.3.0)
+ * ------------------------------------------------------------------ */
+
+/**
+ * shipped_with_ai.items[*].title is one of the two approved public free-name
+ * fields (the other is public_url). The SHARED CONTRACT split, mirrored by
+ * public-dj's server-side re-scrub:
+ *
+ *   - The SECRETS layer is ALWAYS enforced.
+ *   - The path/identifier layer is enforced EXCEPT exactly these categories,
+ *     which are SKIPPED BY DESIGN so explicitly user-approved product/repo
+ *     names can ship: relative_path, filename, dotted_identifier (and the
+ *     bare case-shape identifier rule that exists only to support them).
+ *     That is what lets titles like "vibexp-next", "minutework.ai console",
+ *     and "schema.mw compiler" pass.
+ *   - These categories STILL REJECT: absolute_path, home_path, windows_path,
+ *     email, fenced_code, inline_code, call_expression.
+ */
+const SHIPPED_TITLE_REJECT_RULES: Array<{ category: string; re: RegExp }> = [
+  // Non-global copies: module-level /g regexes are stateful under .test().
+  { category: "fenced_code", re: /(?:```|~~~)[\s\S]*?(?:```|~~~)/ },
+  { category: "inline_code", re: /`[^`\n]{1,}`/ },
+  { category: "windows_path", re: /\b[A-Za-z]:\\(?:[\w .@%+-]+\\?)+/ },
+  { category: "home_path", re: /(?<![\w$])~\/[\w.@%+-]+(?:\/[\w.@%+-]+)*\/?/ },
+  { category: "absolute_path", re: /(?<![\w$])(?:\/[\w.@%+-]+){2,}\/?/ },
+  { category: "email", re: /\b[\w.+%-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b/ },
+  { category: "call_expression", re: /\b[A-Za-z_$][\w$]*\s*\([^)]*\)/ },
+];
+
+/**
+ * Title scan for shipped_with_ai items per the shared contract above.
+ * Returns the categories that fired (empty == clean).
+ */
+export function detectShippedTitleViolations(input: string): string[] {
+  const violations: string[] = [];
+  const layer1 = scrubSecrets(input);
+  if (layer1.count > 0 || !layer1.confident) {
+    violations.push("secret");
+  }
+  for (const rule of SHIPPED_TITLE_REJECT_RULES) {
+    if (rule.re.test(input)) {
+      violations.push(rule.category);
+    }
+  }
+  return violations;
+}
+
+const IPV4_HOST_RE = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+
+/**
+ * Dedicated public_url validator for shipped_with_ai items per the shared
+ * contract: the secrets layer is ALWAYS enforced; the entire path/identifier
+ * layer is SKIPPED (URLs are paths by construction); instead the URL must be
+ * https://, carry no userinfo (no '@' before the host), resolve to a public
+ * hostname (not an IP literal, localhost, *.local, or *.internal), and be at
+ * most 300 characters. Returns the violation categories (empty == clean).
+ */
+export function detectShippedUrlViolations(input: string): string[] {
+  const violations: string[] = [];
+  const layer1 = scrubSecrets(input);
+  if (layer1.count > 0 || !layer1.confident) {
+    violations.push("secret");
+  }
+  if (input.length > 300) {
+    violations.push("url_too_long");
+  }
+  if (/\s/.test(input)) {
+    violations.push("url_whitespace");
+  }
+  if (!input.startsWith("https://")) {
+    violations.push("url_not_https");
+    return violations;
+  }
+  if (/^https:\/\/[^/?#]*@/.test(input)) {
+    violations.push("url_userinfo");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(input);
+  } catch {
+    violations.push("url_unparseable");
+    return violations;
+  }
+  if (parsed.username || parsed.password) {
+    if (!violations.includes("url_userinfo")) {
+      violations.push("url_userinfo");
+    }
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (!host) {
+    violations.push("url_no_host");
+  } else {
+    if (IPV4_HOST_RE.test(host) || host.includes(":") || host.startsWith("[")) {
+      violations.push("url_ip_host");
+    }
+    if (
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      host === "local" ||
+      host.endsWith(".local") ||
+      host === "internal" ||
+      host.endsWith(".internal")
+    ) {
+      violations.push("url_internal_host");
+    }
+  }
+  return violations;
+}

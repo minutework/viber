@@ -1,5 +1,5 @@
 /**
- * Schema 1.2.0 repo_architecture block tests.
+ * repo_architecture block tests (introduced in schema 1.2.0; current pin 1.3.0).
  *
  * Covers the new OPTIONAL top-level `repo_architecture` /`combined_score` /
  * `combined_grade` properties: closure of every nested object (dimensions,
@@ -47,18 +47,20 @@ function assertInvalid(profile: unknown, message?: string): void {
 
 // 1. Back-compat: optional-block additions are non-breaking by construction;
 // the ONLY breaking change is the schema_version const itself. A byte-identical
-// 1.1.0-shaped payload validates once stamped 1.2.0, and the same profile
-// carrying the literal "1.1.0" rejects (const-pinned versioning convention;
-// servers keep accepting archived 1.1.0 payloads against their vendored 1.1.0
-// schema via the server-side compatibility map — out of scope here).
-test("a 1.1.0-shaped profile (no repo block) still validates under 1.2.0", () => {
+// 1.2.0-shaped payload validates once stamped 1.3.0, and the same profile
+// carrying an old literal ("1.2.0" or "1.1.0") rejects (const-pinned versioning
+// convention; servers keep accepting archived payloads against their vendored
+// older schemas via the server-side compatibility map — out of scope here).
+test("a 1.2.0-shaped profile (no repo block) still validates under 1.3.0", () => {
   assertValid(makeValidProfile(), "repo-block-free profile must stay valid");
 });
 
-test("the literal schema_version 1.1.0 rejects against the 1.2.0 schema", () => {
-  const profile = structuredClone(makeValidProfile()) as AnyRecord;
-  profile.schema_version = "1.1.0";
-  assertInvalid(profile, "old schema_version const must reject");
+test("old schema_version literals reject against the 1.3.0 schema", () => {
+  for (const oldVersion of ["1.2.0", "1.1.0"]) {
+    const profile = structuredClone(makeValidProfile()) as AnyRecord;
+    profile.schema_version = oldVersion;
+    assertInvalid(profile, `old schema_version const ${oldVersion} must reject`);
+  }
 });
 
 // 2. Happy path.

@@ -4,6 +4,8 @@ export {
   buildActualMetrics,
   discoverLocalSources,
   gitAggregateMetrics,
+  isMeasurementPrompt,
+  MEASUREMENT_PROMPT_PREFIX,
   type ActualMetricsBundle,
   type ActualMetricsToolCoverage,
   type ActualVibeMetrics,
@@ -13,11 +15,15 @@ export {
   type EpisodeCandidateBundle,
   type GitAggregateMetrics,
   type LocalSourceDiscovery,
+  type ProfileAnalysisOverhead,
+  type ProfileAnalysisOverheadTool,
   type SessionMetadataCandidate,
   type ToolCoverage,
 } from "./extractors.js";
 export { buildAnalysisManifest, type AnalysisManifest } from "./manifest.js";
 export {
+  detectShippedTitleViolations,
+  detectShippedUrlViolations,
   detectViolations,
   redactCodePathsIdentifiers,
   redactField,
@@ -25,6 +31,21 @@ export {
   type LayerResult,
   type RedactionResult,
 } from "./redaction.js";
+export {
+  approvalsFilePath,
+  buildShippedAggregate,
+  buildShippedWithAiBlock,
+  detectShippedCandidates,
+  readShippedApprovals,
+  recomputeShippedSummary,
+  writeShippedApprovals,
+  type ShippedApprovalsFile,
+  type ShippedCandidate,
+  type ShippedDetection,
+  type ShippedItem,
+  type ShippedSummary,
+  type ShippedWithAiBlock,
+} from "./shipped.js";
 export {
   loadProfileSchema,
   RUBRIC_VERSION,
