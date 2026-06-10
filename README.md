@@ -69,3 +69,31 @@ npm run typecheck      # tsc, no emit
 npm run build          # tsc -> dist/ + vendor the frozen schema
 npm test               # node --test (redaction + schema + dry-run + submit)
 ```
+
+## Living profile (daily refresh)
+
+A profile should never go stale. `bin/viber-refresh` re-runs the analysis once
+per LOCAL day with anacron-style catch-up, and `scripts/install-schedule.sh`
+wires it into macOS launchd:
+
+```sh
+./scripts/install-schedule.sh install --project /path/to/your/project
+./scripts/install-schedule.sh status     # loaded? last run? stamp?
+./scripts/install-schedule.sh uninstall
+```
+
+Semantics: fires at **00:15 local time**; launchd coalesces firings missed
+while asleep, and a `RunAtLoad` firing at login covers machines that were
+powered off at midnight — a date stamp in `~/.viber/refresh/` makes catch-ups
+at-most-once-per-day. The digest caches keep repeat runs cheap (only new
+sessions cost LLM work).
+
+Without a non-interactive token source the nightly run is **prepare-only**
+(full analysis, caches warmed, payload validated, nothing sent). To publish
+automatically, set `VIBER_TOKEN_COMMAND` in `~/.viber/refresh/config` to a
+command that prints a fresh submission token (self-hosted operators can point
+it at a platform management command). `upload.sh` also accepts a pre-minted
+`VIBER_SUBMIT_TOKEN` from the environment for unattended runs.
+
+Linux: use a systemd user timer with `OnCalendar=*-*-* 00:15` and
+`Persistent=true` pointing at `bin/viber-refresh`.

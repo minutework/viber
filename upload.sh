@@ -447,9 +447,24 @@ PY
 if [ "$DRY_RUN" -eq 1 ]; then
   log "--dry-run: skipping OAuth; the agent will print the payload and send nothing."
 else
-  if ! mint_submit_token; then
-    err "Could not mint a submission token. You can still preview with --dry-run."
-    exit 1
+  # Non-interactive token sources (scheduled/unattended runs):
+  #  - VIBER_SUBMIT_TOKEN already in the environment, or
+  #  - VIBER_TOKEN_COMMAND: a user-configured command that prints a fresh
+  #    signed submission token to stdout (e.g. a self-hosted platform's
+  #    management command). The token is short-lived and held in memory only.
+  if [ -z "${VIBER_SUBMIT_TOKEN:-}" ] && [ -n "${VIBER_TOKEN_COMMAND:-}" ]; then
+    log "Minting submission token via VIBER_TOKEN_COMMAND (non-interactive)."
+    SUBMIT_TOKEN="$(sh -c "$VIBER_TOKEN_COMMAND" 2>/dev/null | tail -1 | tr -d '[:space:]')" || SUBMIT_TOKEN=""
+  fi
+  if [ -n "${VIBER_SUBMIT_TOKEN:-}" ]; then
+    SUBMIT_TOKEN="$VIBER_SUBMIT_TOKEN"
+    log "Using submission token from the environment (non-interactive)."
+  fi
+  if [ -z "$SUBMIT_TOKEN" ]; then
+    if ! mint_submit_token; then
+      err "Could not mint a submission token. You can still preview with --dry-run."
+      exit 1
+    fi
   fi
 fi
 
