@@ -1,16 +1,18 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import type { Readable, Writable } from "node:stream";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { resolveConfig, type ViberMcpConfig } from "./config.js";
+import { readSubmissionToken, resolveConfig, type ViberMcpConfig } from "./config.js";
 import { buildWrappedAggregates } from "./aggregates.js";
 import { buildActualMetrics, buildEpisodeCandidates, discoverLocalSources, gitAggregateMetrics } from "./extractors.js";
 import { buildAnalysisManifest } from "./manifest.js";
 import { analyzeRepoArchitecture } from "./repo-architecture.js";
 import { scoreEpisodes } from "./score.js";
-import { submitProfile } from "./submit.js";
+import { refreshProfileMetrics, submitProfile, type SubmitOutcome } from "./submit.js";
 
 export interface ViberMcpCliOptions {
   args?: string[];
@@ -23,12 +25,88 @@ export interface ViberMcpCliOptions {
 export interface ParsedCliArgs {
   help: boolean;
   dryRun: boolean;
+  metricsRefresh: boolean;
+  scoreHealth: boolean;
+}
+
+function writeSubmitResultMarker(config: ViberMcpConfig, operation: string, outcome: SubmitOutcome): void {
+  if (!config.submitResultFile) {
+    return;
+  }
+  mkdirSync(dirname(config.submitResultFile), { recursive: true, mode: 0o700 });
+  writeFileSync(
+    config.submitResultFile,
+    `${JSON.stringify(
+      {
+        ok: outcome.ok,
+        dry_run: outcome.dryRun,
+        operation,
+        status: outcome.status ?? null,
+        error_count: outcome.errors.length,
+        written_at: new Date().toISOString(),
+      },
+      null,
+      2,
+    )}\n`,
+    { mode: 0o600 },
+  );
+}
+
+const STAGE_PROGRESS: Record<string, number> = {
+  analysis_manifest: 5,
+  discover_local_sources: 15,
+  build_actual_metrics: 35,
+  build_episode_candidates: 55,
+  git_aggregate_metrics: 65,
+  build_wrapped_aggregates: 75,
+  score_episodes: 88,
+  metrics_refresh: 95,
+  submit_profile: 100,
+};
+
+function writeProgressMarker(config: ViberMcpConfig, stage: string, state: "started" | "completed" | "failed"): void {
+  if (!config.progressFile) {
+    return;
+  }
+  try {
+    mkdirSync(dirname(config.progressFile), { recursive: true, mode: 0o700 });
+    writeFileSync(
+      config.progressFile,
+      `${JSON.stringify(
+        {
+          stage,
+          state,
+          progress_pct: STAGE_PROGRESS[stage] ?? null,
+          written_at: new Date().toISOString(),
+        },
+        null,
+        2,
+      )}\n`,
+      { mode: 0o600 },
+    );
+  } catch {
+    // Progress is best-effort only; never fail profile generation because of it.
+  }
+}
+
+async function withProgress<T>(config: ViberMcpConfig, stage: string, action: () => T | Promise<T>): Promise<T> {
+  writeProgressMarker(config, stage, "started");
+  try {
+    const result = await action();
+    writeProgressMarker(config, stage, "completed");
+    return result;
+  } catch (error) {
+    writeProgressMarker(config, stage, "failed");
+    throw error;
+  }
 }
 
 export function parseViberMcpCliArgs(args: string[]): ParsedCliArgs {
   return {
     help: args.includes("--help") || args.includes("-h"),
     dryRun: args.includes("--dry-run"),
+    metricsRefresh: args.includes("--metrics-refresh"),
+    scoreHealth: args.includes("--score-health"),
   };
 }
 
@@ -59,15 +137,19 @@ export function renderViberMcpHelp(): string {
     "Flags:",
     "  --dry-run                 Print the exact payload that would be sent and",
     "                            send NOTHING. (Also enabled by VIBER_DRY_RUN=1.)",
+    "  --metrics-refresh         Build uncapped deterministic metrics locally and",
+    "                            POST only the metrics-refresh payload.",
+    "  --score-health            Check scoring readiness and exit before analysis.",
     "  -h, --help                Show this help.",
     "",
     "Environment:",
     "  VIBER_SUBMIT_TOKEN        Signed submission token (set by the bootstrap).",
-    "  VIBER_PUBLIC_DJ_BASE_URL  public-dj base URL (default https://viber.minutework.ai).",
+    "  VIBER_PUBLIC_DJ_BASE_URL  public-dj base URL (default https://profile.vibexp.com).",
     "  VIBER_INGEST_URL          Override the full ingest URL.",
     "  VIBER_SCORE_URL           Override the full score proxy URL.",
     "  VIBER_SELECTED_PROJECT_PATH Project path selected by upload.sh (default cwd).",
-    "  VIBER_SCRATCH_DIR          Ephemeral 0700 scratch dir for digest-only replay cache.",
+    "  VIBER_SCRATCH_DIR          Ephemeral 0700 scratch dir for temp wrappers/tokens.",
+    "  VIBER_CACHE_DIR            Persistent 0700 digest-only replay cache.",
     "  VIBER_DRY_RUN             '1'/'true' to force dry-run.",
   ].join("\n");
 }
@@ -95,11 +177,13 @@ export function createViberMcpServer(config: ViberMcpConfig) {
       },
     },
     async (input: { max_sessions?: number }) =>
-      createStructuredToolResult(
-        discoverLocalSources({
-          projectPath: config.selectedProjectPath,
-          maxSessions: input.max_sessions,
-        }),
+      withProgress(config, "discover_local_sources", () =>
+        createStructuredToolResult(
+          discoverLocalSources({
+            projectPath: config.selectedProjectPath,
+            maxSessions: input.max_sessions,
+          }),
+        ),
       ),
   );
 
@@ -113,7 +197,10 @@ export function createViberMcpServer(config: ViberMcpConfig) {
         "paths, filenames, identifiers, hashes, or code. Sends nothing over the network.",
       inputSchema: {},
     },
-    async () => createStructuredToolResult(buildActualMetrics({ projectPath: config.selectedProjectPath })),
+    async () =>
+      withProgress(config, "build_actual_metrics", () =>
+        createStructuredToolResult(buildActualMetrics({ projectPath: config.selectedProjectPath })),
+      ),
   );
 
   server.registerTool(
@@ -136,11 +223,13 @@ export function createViberMcpServer(config: ViberMcpConfig) {
       },
     },
     async (input: { max_sessions?: number }) =>
-      createStructuredToolResult(
-        buildWrappedAggregates({
-          projectPath: config.selectedProjectPath,
-          maxSessions: input.max_sessions,
-        }),
+      withProgress(config, "build_wrapped_aggregates", () =>
+        createStructuredToolResult(
+          buildWrappedAggregates({
+            projectPath: config.selectedProjectPath,
+            maxSessions: input.max_sessions,
+          }),
+        ),
       ),
   );
 
@@ -196,11 +285,13 @@ export function createViberMcpServer(config: ViberMcpConfig) {
       },
     },
     async (input: { max_sessions?: number }) =>
-      createStructuredToolResult(
-        buildEpisodeCandidates({
-          projectPath: config.selectedProjectPath,
-          maxSessions: input.max_sessions,
-        }),
+      withProgress(config, "build_episode_candidates", () =>
+        createStructuredToolResult(
+          buildEpisodeCandidates({
+            projectPath: config.selectedProjectPath,
+            maxSessions: input.max_sessions,
+          }),
+        ),
       ),
   );
 
@@ -212,7 +303,10 @@ export function createViberMcpServer(config: ViberMcpConfig) {
         "and returns no commit hashes, authors, paths, filenames, remotes, or repo names.",
       inputSchema: {},
     },
-    async () => createStructuredToolResult(gitAggregateMetrics({ projectPath: config.selectedProjectPath })),
+    async () =>
+      withProgress(config, "git_aggregate_metrics", () =>
+        createStructuredToolResult(gitAggregateMetrics({ projectPath: config.selectedProjectPath })),
+      ),
   );
 
   server.registerTool(
@@ -224,7 +318,7 @@ export function createViberMcpServer(config: ViberMcpConfig) {
         "This tool sends nothing over the network.",
       inputSchema: {},
     },
-    async () => createStructuredToolResult(buildAnalysisManifest()),
+    async () => withProgress(config, "analysis_manifest", () => createStructuredToolResult(buildAnalysisManifest())),
   );
 
   server.registerTool(
@@ -243,17 +337,19 @@ export function createViberMcpServer(config: ViberMcpConfig) {
       },
     },
     async (input: { episodes: unknown }) => {
-      const outcome = await scoreEpisodes({
-        episodes: input.episodes,
-        token: config.token,
-        scoreUrl: config.scoreUrl,
-        cacheDir: config.scratchDir,
-      });
-      return createStructuredToolResult({
-        ok: outcome.ok,
-        status: outcome.status ?? null,
-        errors: outcome.errors,
-        response: outcome.responseBody ?? null,
+      return withProgress(config, "score_episodes", async () => {
+        const outcome = await scoreEpisodes({
+          episodes: input.episodes,
+          token: readSubmissionToken(config),
+          scoreUrl: config.scoreUrl,
+          cacheDir: config.cacheDir || config.scratchDir,
+        });
+        return createStructuredToolResult({
+          ok: outcome.ok,
+          status: outcome.status ?? null,
+          errors: outcome.errors,
+          response: outcome.responseBody ?? null,
+        });
       });
     },
   );
@@ -279,21 +375,24 @@ export function createViberMcpServer(config: ViberMcpConfig) {
       },
     },
     async (input: { profile: unknown; dry_run?: boolean }) => {
-      const dryRun = config.dryRun || input.dry_run === true;
-      const outcome = await submitProfile({
-        profile: input.profile,
-        token: config.token,
-        ingestUrl: config.ingestUrl,
-        dryRun,
-      });
-      return createStructuredToolResult({
-        ok: outcome.ok,
-        dry_run: outcome.dryRun,
-        status: outcome.status ?? null,
-        errors: outcome.errors,
-        response: outcome.responseBody ?? null,
-        // In dry-run we surface the exact payload so the user can diff it.
-        payload: outcome.dryRun ? outcome.payload : undefined,
+      return withProgress(config, "submit_profile", async () => {
+        const dryRun = config.dryRun || input.dry_run === true;
+        const outcome = await submitProfile({
+          profile: input.profile,
+          token: readSubmissionToken(config),
+          ingestUrl: config.ingestUrl,
+          dryRun,
+        });
+        writeSubmitResultMarker(config, "submit_profile", outcome);
+        return createStructuredToolResult({
+          ok: outcome.ok,
+          dry_run: outcome.dryRun,
+          status: outcome.status ?? null,
+          errors: outcome.errors,
+          response: outcome.responseBody ?? null,
+          // In dry-run we surface the exact payload so the user can diff it.
+          payload: outcome.dryRun ? outcome.payload : undefined,
+        });
       });
     },
   );
@@ -314,6 +413,42 @@ export async function runViberMcpCli(options: ViberMcpCliOptions = {}): Promise<
   }
 
   const config = resolveConfig(env, parsed.dryRun);
+  if (parsed.scoreHealth) {
+    const response = await fetch(config.scoreHealthUrl, {
+      method: "GET",
+      headers: { accept: "application/json" },
+    });
+    const text = await response.text();
+    stdout.write(`${text}\n`);
+    return response.ok ? 0 : 1;
+  }
+  if (parsed.metricsRefresh) {
+    writeProgressMarker(config, "metrics_refresh", "started");
+    const actualMetrics = buildActualMetrics({ projectPath: config.selectedProjectPath });
+    const gitMetrics = gitAggregateMetrics({ projectPath: config.selectedProjectPath });
+    const outcome = await refreshProfileMetrics({
+      vibeMetrics: actualMetrics.vibe_metrics,
+      gitMetrics: gitMetrics.git_metrics,
+      clientTelemetry: {
+        os_family: osFamily(),
+        mcp_version: "1.0.0",
+      },
+      token: readSubmissionToken(config),
+      metricsRefreshUrl: config.metricsRefreshUrl,
+      dryRun: config.dryRun,
+    });
+    writeSubmitResultMarker(config, "metrics_refresh", outcome);
+    writeProgressMarker(config, "metrics_refresh", outcome.ok ? "completed" : "failed");
+    stdout.write(`${JSON.stringify({
+      ok: outcome.ok,
+      dry_run: outcome.dryRun,
+      status: outcome.status ?? null,
+      errors: outcome.errors,
+      response: outcome.responseBody ?? null,
+      payload: outcome.dryRun ? outcome.payload : undefined,
+    }, null, 2)}\n`);
+    return outcome.ok ? 0 : 1;
+  }
   const server = createViberMcpServer(config);
   const transport = new StdioServerTransport(options.stdin, stdout);
 
@@ -327,6 +462,13 @@ export async function runViberMcpCli(options: ViberMcpCliOptions = {}): Promise<
     };
     server.connect(transport).catch(reject);
   });
+}
+
+function osFamily(): "darwin" | "linux" | "windows" | "unknown" {
+  if (process.platform === "darwin") return "darwin";
+  if (process.platform === "linux") return "linux";
+  if (process.platform === "win32") return "windows";
+  return "unknown";
 }
 
 function createStructuredToolResult<T>(payload: T) {

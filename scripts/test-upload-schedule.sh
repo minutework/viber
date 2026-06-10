@@ -6,7 +6,7 @@ UPLOAD="$ROOT/upload.sh"
 
 bash -n "$UPLOAD"
 
-TMPDIR_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/viber-schedule-test.XXXXXX")"
+TMPDIR_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/vibexp-schedule-test.XXXXXX")"
 cleanup() {
   if [ -n "${SERVER_PID:-}" ]; then
     kill "$SERVER_PID" >/dev/null 2>&1 || true
@@ -17,7 +17,7 @@ trap cleanup EXIT
 
 HOME_DIR="$TMPDIR_ROOT/home"
 PROJECT_DIR="$TMPDIR_ROOT/project with spaces"
-VIBER_HOME_DIR="$HOME_DIR/.viber"
+VIBER_HOME_DIR="$HOME_DIR/.vibexp"
 mkdir -p "$HOME_DIR" "$PROJECT_DIR"
 PROJECT_CANON="$(cd "$PROJECT_DIR" && pwd -P)"
 
@@ -26,7 +26,7 @@ VIBER_HOME="$VIBER_HOME_DIR" \
 VIBER_SCHEDULE_INSTALL_DRY_RUN=1 \
   bash "$UPLOAD" --schedule-only --project "$PROJECT_DIR"
 
-RUNNER="$VIBER_HOME_DIR/bin/viber-refresh"
+RUNNER="$VIBER_HOME_DIR/bin/vibexp-refresh"
 CONFIG="$VIBER_HOME_DIR/refresh/config"
 CREDENTIAL="$VIBER_HOME_DIR/refresh/credential"
 
@@ -122,6 +122,7 @@ HOME="$HOME_DIR" VIBER_HOME="$VIBER_HOME_DIR" "$RUNNER" --force
 
 grep -Fx "" "$TOKEN_CAPTURE" >/dev/null
 grep -F -- "--dry-run" "$ARGS_CAPTURE" >/dev/null
+grep -F -- "--metrics-refresh" "$ARGS_CAPTURE" >/dev/null
 [ ! -s "$CREDENTIAL_ENV_CAPTURE" ]
 
 echo "upload schedule tests passed"

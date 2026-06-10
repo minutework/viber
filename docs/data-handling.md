@@ -1,6 +1,6 @@
 # Data handling — exactly what leaves your machine
 
-**Contract version:** schema `1.0.0` / rubric `1.0.0`
+**Contract version:** schema `1.1.0` / rubric `1.1.0`
 
 viber analyzes your coding-agent transcripts **locally, inside your own agent, on your own
 subscription**. The only thing transmitted is a single schema-valid **profile JSON** (the shape in
@@ -14,7 +14,8 @@ This tool is **open source** and runs in **your** agent — you can read every l
 and diff the exact payload with `--dry-run` before anything is sent.
 
 The bundled MCP server also provides local-only discovery helpers:
-`discover_local_sources()`, `build_episode_candidates()`, and `git_aggregate_metrics()`. These
+`discover_local_sources()`, `build_actual_metrics()`, `build_episode_candidates()`, and
+`git_aggregate_metrics()`. These
 helpers read Claude/Codex/Cursor transcript stores and host-side git metadata for the selected
 project, but send nothing over the network. Cursor extraction uses `sqlite3` against Cursor's
 `state.vscdb` in read-only immutable mode and only counts project-scoped rows.
@@ -60,7 +61,7 @@ client telemetry.
 | Secrets, API keys, tokens, JWTs, PEM keys, DB URLs with creds | Layer-1 secret scrubber, fail-closed. |
 | Other repos, remotes, org names | **Project-scoped only.** The skill analyzes the one chosen project and never enumerates, catalogs, or transmits other repos/remotes/orgs. `repos_considered` is asserted `== 1`. |
 | `~/.ssh`, `~/.aws`, keychains, env files, the docker socket | Out of scope; the analyzer reads only agent-transcript locations + host-side `git`. |
-| A second persisted copy of your raw data | Any working cache is **ephemeral** and purged on completion. No `~/.viber/cache` of raw transcripts. The score replay cache stores only request digests and returned nonce payloads. |
+| A second persisted copy of your raw data | Raw working files are **ephemeral** and purged on completion. The persistent `~/.vibexp/cache/<project_digest>/` stores only salted request digests, extractor/version stamps, redacted derived aggregates, and score nonce replay data. No raw transcripts, source code, paths, filenames, repo names, hashes, emails, refresh credentials, or submission tokens. |
 
 > Two of these rows — **host-side git derivation** (never reading working-tree blobs) and the
 > **ephemeral cache** (no second persisted copy) — are guarantees of the open-source client/runtime,

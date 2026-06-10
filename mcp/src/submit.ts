@@ -61,6 +61,15 @@ const STRUCTURED_FIELD_SEGMENTS = new Set<string>([
   "started_at",
   "ended_at",
   "authored_at",
+  "last_stats_refresh_at",
+  "next_stats_refresh_at",
+  "last_ai_analysis_at",
+  "next_ai_analysis_at",
+  "analysis_cadence",
+  "metrics_refresh_cadence",
+  "metrics_scope",
+  "token_source",
+  "status",
   "type",
   "tool",
   "parallelism",
@@ -116,6 +125,103 @@ export interface SubmitOutcome {
   status?: number;
   responseBody?: unknown;
   errors: string[];
+}
+
+export interface MetricsRefreshOptions {
+  vibeMetrics: unknown;
+  gitMetrics?: unknown;
+  clientTelemetry?: unknown;
+  token: string;
+  metricsRefreshUrl: string;
+  dryRun: boolean;
+  /** Injectable for tests; defaults to global fetch. */
+  fetchImpl?: typeof fetch;
+}
+
+export async function refreshProfileMetrics(options: MetricsRefreshOptions): Promise<SubmitOutcome> {
+  const payload = {
+    vibe_metrics: options.vibeMetrics,
+    ...(options.gitMetrics && typeof options.gitMetrics === "object" ? { git_metrics: options.gitMetrics } : {}),
+    ...(options.clientTelemetry && typeof options.clientTelemetry === "object"
+      ? { client_telemetry: options.clientTelemetry }
+      : {}),
+  };
+
+  const scan = scanProfileForLeaks(payload);
+  if (!scan.clean) {
+    return {
+      ok: false,
+      dryRun: options.dryRun,
+      payload,
+      errors: [
+        "Metrics refresh failed the client redaction backstop (fail-closed):",
+        ...scan.violations.map((violation) => `Redaction backstop hit at ${violation.pointer}: ${violation.layers.join(", ")}`),
+      ],
+    };
+  }
+
+  if (options.dryRun) {
+    return {
+      ok: true,
+      dryRun: true,
+      payload,
+      errors: [],
+    };
+  }
+
+  if (!options.token) {
+    return {
+      ok: false,
+      dryRun: false,
+      payload,
+      errors: ["No submission token provided; cannot refresh profile metrics."],
+    };
+  }
+
+  const fetchImpl = options.fetchImpl ?? fetch;
+  let response: Response;
+  try {
+    response = await fetchImpl(options.metricsRefreshUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: options.token, ...payload }),
+    });
+  } catch (cause) {
+    return {
+      ok: false,
+      dryRun: false,
+      payload,
+      errors: [`Network error POSTing to metrics refresh endpoint: ${cause instanceof Error ? cause.message : String(cause)}`],
+    };
+  }
+
+  let responseBody: unknown = null;
+  const rawText = await response.text();
+  try {
+    responseBody = rawText ? JSON.parse(rawText) : null;
+  } catch {
+    responseBody = rawText;
+  }
+
+  if (!response.ok) {
+    return {
+      ok: false,
+      dryRun: false,
+      payload,
+      status: response.status,
+      responseBody,
+      errors: [`Metrics refresh endpoint returned ${response.status}`],
+    };
+  }
+
+  return {
+    ok: true,
+    dryRun: false,
+    payload,
+    status: response.status,
+    responseBody,
+    errors: [],
+  };
 }
 
 export async function submitProfile(options: SubmitOptions): Promise<SubmitOutcome> {
