@@ -192,6 +192,24 @@ export function writeCodexCorpus(home: string, projectPath: string, options: Cod
       payload: { type: "function_call", name: "update_plan", arguments: "{}" },
     },
     {
+      timestamp: "2026-06-09T11:00:40Z",
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "shell",
+        arguments: JSON.stringify({ command: ["bash", "-lc", "pnpm test"] }),
+      },
+    },
+    {
+      timestamp: "2026-06-09T11:02:30Z",
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "shell",
+        arguments: JSON.stringify({ command: "git commit -m 'ship the index fix'" }),
+      },
+    },
+    {
       timestamp: "2026-06-09T11:00:30Z",
       type: "response_item",
       payload: { type: "function_call_output", output: "plan updated" },

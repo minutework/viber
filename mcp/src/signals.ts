@@ -64,8 +64,10 @@ export interface SessionSignals {
   contextCraftEditCount: number;
   /** Timestamps (ms) of in-transcript git_commit events (pairs with commitShaRefs). */
   commitEventTimesMs: number[];
-  /** Classified Bash test runs with their result outcome. */
+  /** Classified Bash test runs with their result outcome (Claude id-joined). */
   testRuns: Array<{ atMs: number; outcome: "pass" | "fail" }>;
+  /** Test-command invocations without a joinable outcome (Codex shell calls). */
+  testCommandTimesMs: number[];
   /** AskUserQuestion answer latencies (ms) for answered questions. */
   askAnswerLatenciesMs: number[];
   askUnansweredCount: number;
@@ -109,6 +111,7 @@ export function emptySessionSignals(): SessionSignals {
     contextCraftEditCount: 0,
     commitEventTimesMs: [],
     testRuns: [],
+    testCommandTimesMs: [],
     askAnswerLatenciesMs: [],
     askUnansweredCount: 0,
   };
@@ -409,7 +412,47 @@ export function collectCodexSignals(signals: SessionSignals, salt: string, recor
         signals.updatePlanCount += 1;
       }
     }
+    // Codex shell calls carry the command inside a JSON `arguments` string.
+    // Commit/test invocations feed the same linkage stats Claude gets from
+    // its native git_commit events and id-joined Bash runs.
+    const command = extractCodexShellCommand(payload.arguments);
+    if (command) {
+      const ms = recordTimestampMs(record);
+      if (ms !== null) {
+        if (/\bgit\b[^|;&\n]*\bcommit\b/.test(command) && signals.commitEventTimesMs.length < MAX_COMMIT_REFS) {
+          signals.commitEventTimesMs.push(ms);
+        }
+        if (classifyCommand(command) === "test" && signals.testCommandTimesMs.length < MAX_TEST_RUNS) {
+          signals.testCommandTimesMs.push(ms);
+        }
+      }
+    }
   }
+}
+
+function extractCodexShellCommand(argumentsRaw: unknown): string | undefined {
+  if (typeof argumentsRaw !== "string" || argumentsRaw.length > 20_000) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(argumentsRaw) as Record<string, unknown>;
+    const command = parsed.command ?? parsed.cmd;
+    if (typeof command === "string") {
+      return command.slice(0, 2000);
+    }
+    if (Array.isArray(command)) {
+      const parts = command.filter((part): part is string => typeof part === "string");
+      // Codex usually wraps the real script as ["bash", "-lc", "<script>"];
+      // unwrap so command classification sees the script itself.
+      if (parts.length >= 3 && /^(ba|z|da|fi)?sh$/.test(parts[0]) && /^-l?c$/.test(parts[1])) {
+        return parts.slice(2).join(" ").slice(0, 2000);
+      }
+      return parts.join(" ").slice(0, 2000);
+    }
+  } catch {
+    // Not JSON arguments; nothing to extract.
+  }
+  return undefined;
 }
 
 /** Collects signals from one Cursor composerData value. */

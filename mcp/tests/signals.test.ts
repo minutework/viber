@@ -49,6 +49,9 @@ test("behavior signals capture models, modes, tools, interrupts, and telemetry p
     assert.equal(codex.signals.interruptCount, 1, "turn_aborted(reason=interrupted) counts as interrupt");
     assert.equal(codex.signals.updatePlanCount, 1);
     assert.equal(codex.signals.originator, "codex_cli");
+    // Shell function_calls feed the same linkage stats Claude gets natively.
+    assert.equal(codex.signals.commitEventTimesMs.length, 1, "git commit shell call recorded");
+    assert.equal(codex.signals.testCommandTimesMs.length, 1, "test shell call recorded");
   } finally {
     cleanup(root);
   }

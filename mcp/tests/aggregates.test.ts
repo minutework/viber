@@ -189,3 +189,47 @@ test("edit precision and test runs join tool_use to tool_result outcomes", () =>
     cleanup(root);
   }
 });
+
+test("generated artifacts are excluded from line stats and rework requires same-file fixes", () => {
+  const root = makeTempDir();
+  try {
+    const home = path.join(root, "home-empty");
+    const repo = path.join(root, "repo");
+    mkdirSync(repo, { recursive: true });
+    execFileSync("git", ["init", repo], { stdio: "ignore" });
+    const git = (args: string[], env: Record<string, string> = {}) =>
+      execFileSync("git", ["-C", repo, ...args], { stdio: "ignore", env: { ...process.env, ...env } });
+    git(["config", "user.email", "builder@example.com"]);
+    git(["config", "user.name", "Builder One"]);
+    git(["config", "commit.gpgsign", "false"]);
+    const commit = (files: Record<string, string>, message: string, date: string) => {
+      for (const [file, content] of Object.entries(files)) {
+        writeFileSync(path.join(repo, file), content);
+      }
+      git(["add", "."]);
+      git(["commit", "-m", message], { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date });
+    };
+
+    const lockfile = Array.from({ length: 100 }, (_, index) => `dep-${index}: 1.0.0`).join("\n");
+    commit({ "app.ts": "a\nb\n", "pnpm-lock.yaml": lockfile }, "Add feature module", "2026-06-01T10:00:00-07:00");
+    commit({ "app.ts": "a\nb\nc\n" }, "Fix feature crash", "2026-06-01T11:00:00-07:00");
+    commit({ "docs.md": "one\ntwo\n" }, "Add docs page", "2026-06-01T12:00:00-07:00");
+    commit({ "other.ts": "x\n" }, "Fix typo in helper", "2026-06-01T13:00:00-07:00");
+
+    const aggregates = buildWrappedAggregates({ homeDir: home, projectPath: repo });
+    // 2 (app) + 1 (fix line) + 2 (docs) + 1 (helper); the 100 lockfile lines are excluded.
+    expectPeak(aggregates.economics_stats.peak_ship_week, 6);
+    // Commit 1 had a same-file fix within 48h; commit 3 ("Add docs") did not
+    // (the later fix touched only an unrelated file) => 1 of 2 non-fix commits.
+    assert.equal(aggregates.craft_stats.rework_rate_48h, 0.5);
+    // Lockfile excluded from blast radius: commit 1 counts as 1 file.
+    assert.equal(aggregates.craft_stats.median_blast_radius_files, 1);
+  } finally {
+    cleanup(root);
+  }
+});
+
+function expectPeak(value: unknown, linesAdded: number): void {
+  assert.ok(value && typeof value === "object", "peak_ship_week present");
+  assert.equal((value as { lines_added: number }).lines_added, linesAdded);
+}

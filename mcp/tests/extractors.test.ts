@@ -126,6 +126,9 @@ if (sqliteAvailable) {
       const claudeDir = path.join(home, ".claude", "projects", "-private-project");
       const codexDir = path.join(home, ".codex", "sessions", "2026", "06", "09");
       const codexArchiveDir = path.join(home, ".codex", "archived_sessions");
+      // Period assertions are relative to the real clock; fixed dates would
+      // flake whenever the suite runs near a UTC day boundary.
+      const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
       mkdirSync(claudeDir, { recursive: true });
       mkdirSync(codexDir, { recursive: true });
       mkdirSync(codexArchiveDir, { recursive: true });
@@ -135,7 +138,7 @@ if (sqliteAvailable) {
         [
           JSON.stringify({
             type: "assistant",
-            timestamp: "2026-06-09T10:00:00Z",
+            timestamp: minutesAgo(10),
             message: {
               usage: {
                 input_tokens: 100,
@@ -148,7 +151,7 @@ if (sqliteAvailable) {
           }),
           JSON.stringify({
             type: "assistant",
-            timestamp: "2026-06-09T10:10:00Z",
+            timestamp: minutesAgo(5),
             message: {
               usage: {
                 input_tokens: 10,
@@ -165,11 +168,11 @@ if (sqliteAvailable) {
         path.join(codexDir, "rollout-1.jsonl"),
         [
           JSON.stringify({
-            timestamp: "2026-06-09T11:00:00Z",
+            timestamp: minutesAgo(20),
             payload: { cwd: projectPath, info: { total_token_usage: { total_tokens: 1000, input_tokens: 900, output_tokens: 100 } } },
           }),
           JSON.stringify({
-            timestamp: "2026-06-09T11:30:00Z",
+            timestamp: minutesAgo(15),
             payload: { info: { total_token_usage: { total_tokens: 2500, input_tokens: 2300, output_tokens: 200 } } },
           }),
         ].join("\n"),
@@ -178,11 +181,11 @@ if (sqliteAvailable) {
         path.join(codexArchiveDir, "rollout-archived.jsonl"),
         [
           JSON.stringify({
-            timestamp: "2026-06-08T09:00:00Z",
+            timestamp: minutesAgo(25 * 60),
             payload: { cwd: projectPath, info: { total_token_usage: { total_tokens: 700, input_tokens: 650, output_tokens: 50 } } },
           }),
           JSON.stringify({
-            timestamp: "2026-06-08T09:01:00Z",
+            timestamp: minutesAgo(25 * 60 - 1),
             payload: { info: { total_token_usage: { total_tokens: 900, input_tokens: 830, output_tokens: 70 } } },
           }),
         ].join("\n"),
@@ -194,8 +197,8 @@ if (sqliteAvailable) {
         input: [
           "CREATE TABLE cursorDiskKV(key TEXT UNIQUE ON CONFLICT REPLACE, value TEXT);",
           `INSERT INTO cursorDiskKV VALUES('composerData:cursor-composer', ${sqlString(JSON.stringify({ workspacePath: projectPath }))});`,
-          `INSERT INTO cursorDiskKV VALUES('bubbleId:cursor-composer:1', ${sqlString(JSON.stringify({ createdAt: "2026-06-09T12:00:00Z", text: "One" }))});`,
-          `INSERT INTO cursorDiskKV VALUES('bubbleId:cursor-composer:2', ${sqlString(JSON.stringify({ createdAt: "2026-06-09T12:20:00Z", text: "Two" }))});`,
+          `INSERT INTO cursorDiskKV VALUES('bubbleId:cursor-composer:1', ${sqlString(JSON.stringify({ createdAt: minutesAgo(30), text: "One" }))});`,
+          `INSERT INTO cursorDiskKV VALUES('bubbleId:cursor-composer:2', ${sqlString(JSON.stringify({ createdAt: minutesAgo(25), text: "Two" }))});`,
         ].join("\n"),
       });
 
@@ -212,7 +215,10 @@ if (sqliteAvailable) {
       assert.equal(actual.vibe_metrics.token_sources.codex.total_tokens, 3400);
       assert.equal(actual.vibe_metrics.total_tokens, 3805);
       assert.equal(actual.vibe_metrics.provider_tokens_by_period.today, 2905);
-      assert.equal(actual.vibe_metrics.provider_tokens_by_period.this_week, 3805);
+      // The archived session sits ~25h back: inside this_week unless the suite
+      // runs on a Monday, so assert the safe range.
+      assert.equal(actual.vibe_metrics.provider_tokens_by_period.this_week >= 2905, true);
+      assert.equal(actual.vibe_metrics.provider_tokens_by_period.this_week <= 3805, true);
       assert.equal(actual.vibe_metrics.provider_tokens_by_period.this_year <= actual.vibe_metrics.total_tokens, true);
       assert.equal(actual.vibe_metrics.total_vibe_agent_hours > 0, true);
       assert.equal(actual.vibe_metrics.total_active_calendar_hours > 0, true);

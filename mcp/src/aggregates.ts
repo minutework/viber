@@ -163,26 +163,29 @@ function buildGitExtra(
     if (ms === null) {
       continue;
     }
+    // Bulk imports count as commits (time histograms) but never as written lines.
+    const writtenAdded = commit.isBulkImport ? 0 : commit.added;
+    const writtenDeleted = commit.isBulkImport ? 0 : commit.deleted;
     const offset = parseIsoOffsetMinutes(commit.authoredAt) ?? 0;
     const local = new Date(ms + offset * 60_000);
     const hour = local.getUTCHours();
     const weekday = local.getUTCDay();
     hourHistogram[hour] += 1;
     weekdayHistogram[weekday] += 1;
-    locByWeekday[weekday] += commit.added;
+    locByWeekday[weekday] += writtenAdded;
     if (NIGHT_OWL_HOURS.has(hour)) {
       nightOwl += 1;
     }
     const dayKey = local.toISOString().slice(0, 10);
     const slot = byLocalDay.get(dayKey) ?? { commit_count: 0, lines_added: 0, weekday };
     slot.commit_count += 1;
-    slot.lines_added += commit.added;
+    slot.lines_added += writtenAdded;
     byLocalDay.set(dayKey, slot);
     if (nowMs - ms <= THIRTY_DAYS_MS) {
       last30 = {
         commit_count: last30.commit_count + 1,
-        lines_added: last30.lines_added + commit.added,
-        lines_deleted: last30.lines_deleted + commit.deleted,
+        lines_added: last30.lines_added + writtenAdded,
+        lines_deleted: last30.lines_deleted + writtenDeleted,
       };
     }
   }
@@ -730,9 +733,10 @@ function buildCraftStats(
         redToGreenMinutes.push((recovery.atMs - runs[index].atMs) / 60_000);
       }
     }
+    const testTimes = [...runs.map((run) => run.atMs), ...signals.testCommandTimesMs];
     for (const commitMs of signals.commitEventTimesMs) {
       commitsConsidered += 1;
-      if (runs.some((run) => run.atMs <= commitMs)) {
+      if (testTimes.some((atMs) => atMs <= commitMs)) {
         commitsWithTestBefore += 1;
       }
     }
@@ -765,33 +769,15 @@ function buildCraftStats(
   if (contextCraft > 0) {
     out.context_craft_edit_count = contextCraft;
   }
-  if (git.commits.length > 0) {
-    const files = git.commits.map((commit) => commit.files).sort((left, right) => left - right);
+  const authoredCommits = git.commits.filter((commit) => !commit.isBulkImport);
+  if (authoredCommits.length > 0) {
+    const files = authoredCommits.map((commit) => commit.files).sort((left, right) => left - right);
     out.median_blast_radius_files = median(files) ?? 0;
     out.p90_blast_radius_files = files[Math.min(files.length - 1, Math.floor(files.length * 0.9))];
-    const sorted = [...git.commits]
-      .map((commit) => ({ ...commit, ms: parseTimestampMs(commit.authoredAt) }))
-      .filter((commit): commit is GitCommitStat & { ms: number } => commit.ms !== null)
-      .sort((left, right) => left.ms - right.ms);
-    let reworked = 0;
-    let nonFix = 0;
-    for (let index = 0; index < sorted.length; index += 1) {
-      if (sorted[index].isFixLike) {
-        continue;
-      }
-      nonFix += 1;
-      for (let next = index + 1; next < sorted.length; next += 1) {
-        if (sorted[next].ms - sorted[index].ms > 2 * DAY_MS) {
-          break;
-        }
-        if (sorted[next].isFixLike) {
-          reworked += 1;
-          break;
-        }
-      }
-    }
-    if (nonFix > 0) {
-      out.rework_rate_48h = round4(reworked / nonFix);
+    // Same-file rework is computed inside collectGitCommitStats, where the
+    // per-commit file digests are in scope.
+    if (git.reworkRate48h !== undefined) {
+      out.rework_rate_48h = git.reworkRate48h;
     }
     if (git.addedFileCount + git.modifiedFileCount > 0) {
       out.refactor_to_greenfield_ratio = round4(git.modifiedFileCount / (git.addedFileCount + git.modifiedFileCount));
@@ -821,8 +807,9 @@ function buildEconomicsStats(
   if (totalInputSide > 0) {
     out.cache_hit_rate = round4(cachedInput / totalInputSide);
   }
-  const linesAdded = git.commits.reduce((sum, commit) => sum + commit.added, 0);
-  const linesDeleted = git.commits.reduce((sum, commit) => sum + commit.deleted, 0);
+  const writtenCommits = git.commits.filter((commit) => !commit.isBulkImport);
+  const linesAdded = writtenCommits.reduce((sum, commit) => sum + commit.added, 0);
+  const linesDeleted = writtenCommits.reduce((sum, commit) => sum + commit.deleted, 0);
   if (totalTokens > 0 && linesAdded > 0) {
     out.loc_per_million_tokens = round2((linesAdded / totalTokens) * 1_000_000);
   }
@@ -849,7 +836,7 @@ function buildEconomicsStats(
     out.idea_to_commit_median_minutes = round2(median(ideaToCommit) ?? 0);
     out.idea_to_commit_sample_count = ideaToCommit.length;
   }
-  const sorted = git.commits
+  const sorted = writtenCommits
     .map((commit) => ({ ms: parseTimestampMs(commit.authoredAt), added: commit.added }))
     .filter((commit): commit is { ms: number; added: number } => commit.ms !== null)
     .sort((left, right) => left.ms - right.ms);

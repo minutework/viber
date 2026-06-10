@@ -583,16 +583,56 @@ export function collectActualSessionData(options: LocalExtractorOptions = {}): {
 }
 
 /**
+ * Versioned denylist of generated/vendored artifacts excluded from the
+ * "lines you wrote" stat family (peak week, fuel efficiency, churn, blast
+ * radius). Classification happens in-process; paths never leave.
+ * The headline vibe-LOC totals in gitAggregateMetrics intentionally keep the
+ * raw numstat semantics for continuity with published profiles.
+ */
+export const GENERATED_PATH_DENYLIST_VERSION = "1.0.0";
+
+const GENERATED_LOCK_BASENAMES = new Set([
+  "pnpm-lock.yaml",
+  "package-lock.json",
+  "yarn.lock",
+  "poetry.lock",
+  "cargo.lock",
+  "gemfile.lock",
+  "composer.lock",
+  "uv.lock",
+  "go.sum",
+  "bun.lockb",
+]);
+
+const GENERATED_DIR_RE = /(^|\/)(node_modules|vendor|dist|build|out|\.next|target|__generated__|generated|coverage)\//;
+const GENERATED_SUFFIX_RE = /\.(min\.js|min\.css|map|snap)$/;
+
+export function isGeneratedArtifactPath(filePath: string): boolean {
+  const lower = filePath.toLowerCase();
+  const base = lower.split("/").pop() ?? "";
+  return GENERATED_LOCK_BASENAMES.has(base) || GENERATED_SUFFIX_RE.test(base) || GENERATED_DIR_RE.test(lower);
+}
+
+/**
  * Author-filtered commit stats for the aggregates module. Subjects are NEVER
  * returned — fix-likeness is computed in place so no commit text leaves this
- * function.
+ * function — and generated/vendored files are excluded per the denylist above.
  */
+/**
+ * A single commit adding more than this many (post-denylist) lines is a bulk
+ * import/vendor event — a reference tree, a generated archive, a repo merge —
+ * not authored work. Such commits stay in commit counts and time histograms
+ * but are excluded from every "lines you wrote" aggregate.
+ */
+export const BULK_IMPORT_LINES_THRESHOLD = 50_000;
+
 export interface GitCommitStat {
   authoredAt: string;
   added: number;
   deleted: number;
   files: number;
   isFixLike: boolean;
+  isBulkImport: boolean;
 }
 
 export function collectGitCommitStats(options: LocalExtractorOptions = {}): {
@@ -600,6 +640,13 @@ export function collectGitCommitStats(options: LocalExtractorOptions = {}): {
   mergeCommitCount30d: number;
   addedFileCount: number;
   modifiedFileCount: number;
+  /**
+   * Share of non-fix commits followed within 48h by a fix-like commit
+   * TOUCHING AT LEAST ONE OF THE SAME FILES. Computed here because the
+   * per-commit file sets (path digests, in-memory only) never leave this
+   * function.
+   */
+  reworkRate48h?: number;
   warnings: string[];
 } {
   const context = createExtractorContext(options);
@@ -621,6 +668,9 @@ export function collectGitCommitStats(options: LocalExtractorOptions = {}): {
   }
   const authorArgs = authorEmails.map((email) => `--author=${escapeRegExp(email)}`);
   const commits: GitCommitStat[] = [];
+  // Per-commit file digests, used ONLY for the same-file rework join below;
+  // discarded before return.
+  const commitPathDigests: Array<Set<string>> = [];
   try {
     const output = execFileSync(
       gitPath,
@@ -628,14 +678,20 @@ export function collectGitCommitStats(options: LocalExtractorOptions = {}): {
       { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 },
     );
     let current: GitCommitStat | null = null;
+    let currentPaths: Set<string> | null = null;
+    const flush = () => {
+      if (current) {
+        current.isBulkImport = current.added > BULK_IMPORT_LINES_THRESHOLD;
+        commits.push(current);
+        commitPathDigests.push(currentPaths ?? new Set());
+      }
+    };
     for (const line of output.split(/\r?\n/)) {
       if (!line) {
         continue;
       }
       if (line.startsWith("__VIBER_COMMIT__\t")) {
-        if (current) {
-          commits.push(current);
-        }
+        flush();
         const [, authoredAt = "", subject = ""] = line.split("\t");
         current = {
           authoredAt,
@@ -643,23 +699,70 @@ export function collectGitCommitStats(options: LocalExtractorOptions = {}): {
           deleted: 0,
           files: 0,
           isFixLike: /\b(fix|hotfix|bugfix|revert|patch|regression)\b/i.test(subject),
+          isBulkImport: false,
         };
+        currentPaths = new Set();
         continue;
       }
       if (!current) {
         continue;
       }
-      const [addedRaw, deletedRaw] = line.split("\t");
+      const [addedRaw, deletedRaw, fileRaw = ""] = line.split("\t");
+      if (fileRaw && isGeneratedArtifactPath(fileRaw)) {
+        continue;
+      }
       current.added += parseNumstatValue(addedRaw);
       current.deleted += parseNumstatValue(deletedRaw);
       current.files += 1;
+      if (fileRaw) {
+        currentPaths?.add(sha256Hex(fileRaw).slice(0, 16));
+      }
     }
-    if (current) {
-      commits.push(current);
-    }
+    flush();
   } catch {
     warnings.push("git_log_failed");
     return empty;
+  }
+
+  // Rework: a non-fix commit followed within 48h by a fix-like commit that
+  // touches >=1 of the same files. The file overlap requirement is what keeps
+  // busy multi-feature repos from over-firing on unrelated fixes.
+  let reworkRate48h: number | undefined;
+  {
+    const ordered = commits
+      .map((commit, index) => ({ commit, paths: commitPathDigests[index], ms: parseTimestampMs(commit.authoredAt) }))
+      .filter((entry): entry is { commit: GitCommitStat; paths: Set<string>; ms: number } => entry.ms !== null)
+      .sort((left, right) => left.ms - right.ms);
+    let reworked = 0;
+    let nonFix = 0;
+    for (let index = 0; index < ordered.length; index += 1) {
+      if (ordered[index].commit.isFixLike) {
+        continue;
+      }
+      nonFix += 1;
+      for (let next = index + 1; next < ordered.length; next += 1) {
+        if (ordered[next].ms - ordered[index].ms > 48 * 60 * 60 * 1000) {
+          break;
+        }
+        if (!ordered[next].commit.isFixLike) {
+          continue;
+        }
+        let overlaps = false;
+        for (const digest of ordered[next].paths) {
+          if (ordered[index].paths.has(digest)) {
+            overlaps = true;
+            break;
+          }
+        }
+        if (overlaps) {
+          reworked += 1;
+          break;
+        }
+      }
+    }
+    if (nonFix > 0) {
+      reworkRate48h = Math.round((reworked / nonFix) * 10_000) / 10_000;
+    }
   }
   let mergeCommitCount30d = 0;
   try {
@@ -681,6 +784,10 @@ export function collectGitCommitStats(options: LocalExtractorOptions = {}): {
       { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 },
     );
     for (const line of output.split(/\r?\n/)) {
+      const filePath = line.slice(2);
+      if (filePath && isGeneratedArtifactPath(filePath)) {
+        continue;
+      }
       if (line.startsWith("A\t")) {
         addedFileCount += 1;
       } else if (line.startsWith("M\t")) {
@@ -690,7 +797,14 @@ export function collectGitCommitStats(options: LocalExtractorOptions = {}): {
   } catch {
     warnings.push("git_name_status_failed");
   }
-  return { commits, mergeCommitCount30d, addedFileCount, modifiedFileCount, warnings };
+  return {
+    commits,
+    mergeCommitCount30d,
+    addedFileCount,
+    modifiedFileCount,
+    ...(reworkRate48h !== undefined ? { reworkRate48h } : {}),
+    warnings,
+  };
 }
 
 export function gitAggregateMetrics(options: LocalExtractorOptions = {}): GitAggregateMetrics {
