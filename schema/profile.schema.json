@@ -342,6 +342,34 @@
           "type": "string",
           "pattern": "^UTC[+-][0-9]{2}:[0-9]{2}$"
         },
+        "last_stats_refresh_at": {
+          "description": "UTC timestamp for the latest deterministic metrics-only refresh.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "next_stats_refresh_at": {
+          "description": "UTC timestamp when deterministic metrics should refresh next.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "last_ai_analysis_at": {
+          "description": "UTC timestamp for the latest full AI-scored profile analysis.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "next_ai_analysis_at": {
+          "description": "UTC timestamp when full AI analysis should run next.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "analysis_cadence": {
+          "description": "Cadence label for full AI-scored profile analysis.",
+          "enum": ["weekly"]
+        },
+        "metrics_refresh_cadence": {
+          "description": "Cadence label for deterministic metrics refresh.",
+          "enum": ["hourly"]
+        },
         "metrics_coverage": {
           "type": "object",
           "additionalProperties": false,

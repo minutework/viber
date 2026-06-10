@@ -6,7 +6,7 @@
  * or shell-interpolate the token when requesting public-dj integrity nonces.
  */
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 export interface ScoreEpisodesOptions {
@@ -163,6 +163,7 @@ function readScoreCache(cacheDir: string | undefined): ScoreCache {
   if (!cacheDir) {
     return { entries: {} };
   }
+  ensureCacheDir(cacheDir);
   const cachePath = path.join(cacheDir, "score-cache.json");
   if (!existsSync(cachePath)) {
     return { entries: {} };
@@ -182,8 +183,18 @@ function writeScoreCache(cacheDir: string | undefined, cache: ScoreCache): void 
   if (!cacheDir) {
     return;
   }
+  ensureCacheDir(cacheDir);
   const cachePath = path.join(cacheDir, "score-cache.json");
   writeFileSync(cachePath, JSON.stringify(cache), { mode: 0o600 });
+}
+
+function ensureCacheDir(cacheDir: string): void {
+  mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(cacheDir, 0o700);
+  } catch {
+    // Best effort; individual cache files are still written 0600.
+  }
 }
 
 function canonicalJson(value: unknown): string {

@@ -45,8 +45,10 @@ export {
   type ScoreEpisodesOutcome,
 } from "./score.js";
 export {
+  refreshProfileMetrics,
   scanProfileForLeaks,
   submitProfile,
+  type MetricsRefreshOptions,
   type RedactionScan,
   type SubmitOptions,
   type SubmitOutcome,

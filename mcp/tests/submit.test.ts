@@ -6,7 +6,7 @@ import { test } from "node:test";
 
 import { validateProfileAgainstSchema } from "../src/schema.ts";
 import { scoreEpisodes } from "../src/score.ts";
-import { scanProfileForLeaks, submitProfile } from "../src/submit.ts";
+import { refreshProfileMetrics, scanProfileForLeaks, submitProfile } from "../src/submit.ts";
 import { makeValidProfile } from "./fixtures.ts";
 
 test("the fixture profile passes the frozen schema", () => {
@@ -97,6 +97,66 @@ test("live submit POSTs token and profile in the ingest body", async () => {
   assert.deepEqual(JSON.parse(calls[0].init.body as string), {
     token: "signed-token-xyz",
     profile,
+  });
+});
+
+test("metrics refresh POSTs only deterministic metrics blocks", async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fetchImpl = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return new Response(JSON.stringify({ accepted: true }), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const outcome = await refreshProfileMetrics({
+    token: "signed-token-xyz",
+    metricsRefreshUrl: "https://profile.vibexp.com/api/v1/builder-profiles/metrics-refresh/",
+    vibeMetrics: {
+      metrics_scope: "all_project_sessions_uncapped",
+      total_vibe_agent_hours: 2,
+      total_tokens: 100,
+    },
+    gitMetrics: {
+      lines_added: 20,
+      vibe_loc_sources: { committed: 10, tracked_working_tree: 5, untracked: 5 },
+    },
+    dryRun: false,
+    fetchImpl,
+  });
+
+  assert.equal(outcome.ok, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://profile.vibexp.com/api/v1/builder-profiles/metrics-refresh/");
+  assert.deepEqual(JSON.parse(calls[0].init.body as string), {
+    token: "signed-token-xyz",
+    vibe_metrics: {
+      metrics_scope: "all_project_sessions_uncapped",
+      total_vibe_agent_hours: 2,
+      total_tokens: 100,
+    },
+    git_metrics: {
+      lines_added: 20,
+      vibe_loc_sources: { committed: 10, tracked_working_tree: 5, untracked: 5 },
+    },
+  });
+});
+
+test("metrics refresh dry-run sends nothing and returns exact payload", async () => {
+  let fetchCalled = false;
+  const outcome = await refreshProfileMetrics({
+    token: "",
+    metricsRefreshUrl: "https://profile.vibexp.com/api/v1/builder-profiles/metrics-refresh/",
+    vibeMetrics: { metrics_scope: "all_project_sessions_uncapped", total_vibe_agent_hours: 2 },
+    dryRun: true,
+    fetchImpl: (async () => {
+      fetchCalled = true;
+      return new Response("", { status: 200 });
+    }) as unknown as typeof fetch,
+  });
+
+  assert.equal(fetchCalled, false);
+  assert.equal(outcome.ok, true);
+  assert.deepEqual(outcome.payload, {
+    vibe_metrics: { metrics_scope: "all_project_sessions_uncapped", total_vibe_agent_hours: 2 },
   });
 });
 
