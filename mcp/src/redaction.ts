@@ -147,7 +147,13 @@ const DOTTED_IDENTIFIER =
   /\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){1,}\b/g;
 // snake_case / camelCase / PascalCase identifiers that are clearly code-y:
 // require an underscore OR an internal case change OR a trailing () call.
-const CALL_IDENTIFIER = /\b[A-Za-z_$][\w$]*\s*\([^)]*\)/g;
+//
+// Contract pin: this call-expression pattern intentionally mirrors
+// apps/mwv3-public-dj/apps/builder_profile/redaction.py exactly. In
+// particular, there is no optional whitespace between the word and "(", so
+// ordinary prose like "sessions (316 total)" is not treated as a function call.
+export const PUBLIC_DJ_CALL_EXPRESSION_PATTERN = String.raw`\b[A-Za-z_]\w+\([^)]*[A-Za-z_=][^)]*\)`;
+const CALL_IDENTIFIER = new RegExp(PUBLIC_DJ_CALL_EXPRESSION_PATTERN, "g");
 const SNAKE_OR_MIXED_CASE =
   /\b(?:[a-z]+_[a-z0-9_]+|[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*|[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*)\b/g;
 
@@ -329,7 +335,7 @@ const SHIPPED_TITLE_REJECT_RULES: Array<{ category: string; re: RegExp }> = [
   { category: "home_path", re: /(?<![\w$])~\/[\w.@%+-]+(?:\/[\w.@%+-]+)*\/?/ },
   { category: "absolute_path", re: /(?<![\w$])(?:\/[\w.@%+-]+){2,}\/?/ },
   { category: "email", re: /\b[\w.+%-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b/ },
-  { category: "call_expression", re: /\b[A-Za-z_$][\w$]*\s*\([^)]*\)/ },
+  { category: "call_expression", re: new RegExp(PUBLIC_DJ_CALL_EXPRESSION_PATTERN) },
 ];
 
 /**

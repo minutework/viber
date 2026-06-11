@@ -3,10 +3,22 @@ import { test } from "node:test";
 
 import {
   detectViolations,
+  PUBLIC_DJ_CALL_EXPRESSION_PATTERN,
   redactCodePathsIdentifiers,
   redactField,
   scrubSecrets,
 } from "../src/redaction.ts";
+
+test("call-expression redaction pattern is pinned to public-dj", () => {
+  // Keep this literal synchronized with
+  // apps/mwv3-public-dj/apps/builder_profile/redaction.py::_CODE_PATH_PATTERNS
+  // category "call_expression". public-dj is the contract authority.
+  const publicDjCallExpressionPattern = String.raw`\b[A-Za-z_]\w+\([^)]*[A-Za-z_=][^)]*\)`;
+  assert.equal(PUBLIC_DJ_CALL_EXPRESSION_PATTERN, publicDjCallExpressionPattern);
+
+  assert.deepEqual(detectViolations("Plan updates are frequent (316 total)."), []);
+  assert.deepEqual(detectViolations("Calls fetchData(user_id) directly."), ["identifier"]);
+});
 
 test("layer 1 strips a planted GitHub token", () => {
   const result = scrubSecrets("the key is ghp_ABCDEFGHIJ1234567890abcdefghijklmnop here");

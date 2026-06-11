@@ -38,7 +38,8 @@ export async function scoreEpisodes(options: ScoreEpisodesOptions): Promise<Scor
     episode,
     requestDigest: scoreRequestDigest(episode),
   }));
-  const cache = readScoreCache(options.cacheDir);
+  const tokenFingerprint = scoreTokenFingerprint(options.token);
+  const cache = readScoreCache(options.cacheDir, tokenFingerprint);
   const cachedEpisodes = new Map<string, unknown>();
   const missingEpisodes: unknown[] = [];
   const missingDigests: string[] = [];
@@ -100,6 +101,7 @@ export async function scoreEpisodes(options: ScoreEpisodesOptions): Promise<Scor
     responseBody,
     cache,
     cacheDir: options.cacheDir,
+    tokenFingerprint,
     missingDigests,
     cachedEpisodes,
     episodeRequests,
@@ -115,6 +117,7 @@ export async function scoreEpisodes(options: ScoreEpisodesOptions): Promise<Scor
 
 interface ScoreCache {
   handle?: string | null;
+  tokenFingerprint?: string;
   entries: Record<string, unknown>;
 }
 
@@ -122,6 +125,7 @@ function mergeAndCacheScoredEpisodes(options: {
   responseBody: unknown;
   cache: ScoreCache;
   cacheDir?: string;
+  tokenFingerprint: string;
   missingDigests: string[];
   cachedEpisodes: Map<string, unknown>;
   episodeRequests: Array<{ episode: unknown; requestDigest: string }>;
@@ -142,6 +146,7 @@ function mergeAndCacheScoredEpisodes(options: {
   if (typeof responseRecord.handle === "string") {
     options.cache.handle = responseRecord.handle;
   }
+  options.cache.tokenFingerprint = options.tokenFingerprint;
   writeScoreCache(options.cacheDir, options.cache);
   return {
     ...responseRecord,
@@ -159,23 +164,34 @@ function scoreRequestDigest(episode: unknown): string {
   return createHash("sha256").update(canonical).digest("hex");
 }
 
-function readScoreCache(cacheDir: string | undefined): ScoreCache {
+function scoreTokenFingerprint(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function emptyScoreCache(tokenFingerprint: string): ScoreCache {
+  return { tokenFingerprint, entries: {} };
+}
+
+function readScoreCache(cacheDir: string | undefined, tokenFingerprint: string): ScoreCache {
   if (!cacheDir) {
-    return { entries: {} };
+    return emptyScoreCache(tokenFingerprint);
   }
   ensureCacheDir(cacheDir);
   const cachePath = path.join(cacheDir, "score-cache.json");
   if (!existsSync(cachePath)) {
-    return { entries: {} };
+    return emptyScoreCache(tokenFingerprint);
   }
   try {
     const parsed = JSON.parse(readFileSync(cachePath, "utf8")) as ScoreCache;
     if (!parsed || typeof parsed !== "object" || !parsed.entries || typeof parsed.entries !== "object") {
-      return { entries: {} };
+      return emptyScoreCache(tokenFingerprint);
+    }
+    if (parsed.tokenFingerprint !== tokenFingerprint) {
+      return emptyScoreCache(tokenFingerprint);
     }
     return parsed;
   } catch {
-    return { entries: {} };
+    return emptyScoreCache(tokenFingerprint);
   }
 }
 

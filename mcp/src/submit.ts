@@ -68,17 +68,33 @@ const STRUCTURED_FIELD_SEGMENTS = new Set<string>([
   "analysis_cadence",
   "metrics_refresh_cadence",
   "metrics_scope",
+  "metrics_timezone",
   "token_source",
   "status",
   "type",
   "tool",
+  "source",
+  "warnings",
   "parallelism",
+  "primary_tool",
   "agent_type",
+  "intent",
   "session_intent",
   "significance",
   "reversibility",
   "outcome",
   "overall_grade",
+  "combined_grade",
+  "grade",
+  "band",
+  "label",
+  "size_band",
+  "primary_language",
+  "primary_languages",
+  "classifier_version",
+  "raised_by",
+  "test_signal_after",
+  "topics",
   "os_family",
   // shipped_with_ai (schema 1.3.0): enums/dates only — items[*].title and
   // items[*].public_url are intentionally NOT here; they go through the
@@ -92,6 +108,7 @@ const STRUCTURED_FIELD_SEGMENTS = new Set<string>([
   // profile_analysis_overhead (schema 1.3.0): allowlist-normalized model
   // families plus a timestamp; the numerics are not strings and never reach
   // the text walk.
+  "model_family",
   "model_families",
   "last_analysis_at",
 ]);

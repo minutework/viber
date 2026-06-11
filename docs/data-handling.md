@@ -14,6 +14,20 @@ whole submission.
 This tool is **open source** and runs in **your** agent — you can read every line, watch it work,
 and diff the exact payload with `--dry-run` before anything is sent.
 
+Two diagnostic flags are local-only opt-ins for failed runs:
+
+- `VIBER_KEEP_SCRATCH=1` prevents the ephemeral scratch directory from being deleted on exit so
+  you can inspect local MCP progress/result markers. Scratch still lives under the OS temp directory
+  and is never transmitted.
+- `VIBER_DEBUG_SUBMIT_PAYLOAD=1` includes the allowlisted profile payload in the local
+  `submit-result.json` marker when the submit tool writes diagnostics. This payload is the same
+  schema-shaped object that would be validated/submitted, not raw transcripts or source code; it is
+  written only to scratch and never sent anywhere by the debug flag itself.
+
+Failed submit/result markers also include the server response body when one exists. That response
+is written only to the same local scratch marker to make schema/API failures diagnosable; it does
+not include raw transcripts or source code.
+
 The bundled MCP server also provides local-only analysis helpers: `discover_local_sources()`,
 `build_actual_metrics()`, `build_episode_candidates()`, `build_wrapped_aggregates()`,
 `git_aggregate_metrics()`, `analyze_repo_architecture()`, and `get_shipped_with_ai()` — all
@@ -110,7 +124,9 @@ another's submission.
 
 The proxy also stores a server-computed `request_digest` for the redacted score request. Retrying
 the same score request with the same submission token returns the already-issued nonce instead of
-minting a duplicate nonce that would later trip the full-coverage guard.
+minting a duplicate nonce that would later trip the full-coverage guard. The local nonce replay
+cache is scoped by a digest of the short-lived submission token; it never stores the token itself
+and never replays a nonce under a different token fingerprint.
 
 On submission, public-dj does **not** merely check that the nonce exists — it **recomputes** the
 digest and HMAC from the *submitted* episode using its own key, and treats the **proxy-log scores as

@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 import { normalizeRemoteUrl } from "./extractors.js";
+import { detectShippedTitleViolations, detectShippedUrlViolations } from "./redaction.js";
 
 export const SHIPPED_CATEGORIES = [
   "app",
@@ -477,11 +478,47 @@ export function strongestEvidence(evidence: ShippedEvidenceStatus[]): ShippedEvi
   return "git_evidence";
 }
 
+const CONVENTIONAL_COMMIT_TYPE_RE =
+  String.raw`(?:build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)`;
+
+function stripConventionalCommitPrefix(input: string): string {
+  const prefix = `${CONVENTIONAL_COMMIT_TYPE_RE}(?:\\([^)]*\\))?!?:\\s*`;
+  return input
+    .replace(new RegExp(`^\\s*${prefix}`, "i"), "")
+    .replace(new RegExp(`:\\s*${prefix}`, "i"), ": ");
+}
+
+/**
+ * Public default titles must already satisfy the server-side shipped-title
+ * scanner before the user approves them. Defaults therefore remove
+ * conventional-commit type/scope prefixes, parenthetical fragments, and
+ * slash-shaped route/path fragments. The user can still edit the title, but the
+ * review loop validates the edited value before persisting it.
+ */
+export function sanitizeShippedTitle(input: string, fallback: string): string {
+  const candidates = [input, fallback, "Shipped AI outcome"];
+  for (const candidate of candidates) {
+    const cleaned = stripConventionalCommitPrefix(candidate)
+      .replace(/\([^)]*\)/g, " ")
+      .replace(/[\\/]+/g, " ")
+      .replace(/\s*:\s*/g, " - ")
+      .replace(/[`<>]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120)
+      .trim();
+    if (cleaned.length >= 3 && detectShippedTitleViolations(cleaned).length === 0) {
+      return cleaned;
+    }
+  }
+  return "Shipped AI outcome";
+}
+
 /** Default approved item for a candidate (used by review's approve-all path). */
 export function defaultItemForCandidate(candidate: ShippedCandidate): ApprovedShippedItem {
-  const title = candidate.suggested_title.slice(0, 120);
+  const fallback = `${candidate.repo_label} ${candidate.period}`;
   return {
-    title: title.length >= 3 ? title : `${candidate.repo_label} ${candidate.period}`.slice(0, 120),
+    title: sanitizeShippedTitle(candidate.suggested_title, fallback),
     category: candidate.categories[0] ?? "other",
     shipped_on: candidate.period,
     ai_contribution: "unknown",
@@ -565,7 +602,7 @@ function sanitizeApprovedItem(value: unknown): ShippedItem | null {
   }
   const record = value as Record<string, unknown>;
   const title = typeof record.title === "string" ? record.title.trim() : "";
-  if (title.length < 3 || title.length > 120) {
+  if (title.length < 3 || title.length > 120 || detectShippedTitleViolations(title).length > 0) {
     return null;
   }
   if (!SHIPPED_CATEGORIES.includes(record.category as ShippedCategory)) {
@@ -584,7 +621,12 @@ function sanitizeApprovedItem(value: unknown): ShippedItem | null {
     ai_contribution: record.ai_contribution as ShippedAiContribution,
     evidence_status: record.evidence_status as ShippedEvidenceStatus,
   };
-  if (typeof record.public_url === "string" && record.public_url.length > 0 && record.public_url.length <= 300) {
+  if (
+    typeof record.public_url === "string" &&
+    record.public_url.length > 0 &&
+    record.public_url.length <= 300 &&
+    detectShippedUrlViolations(record.public_url).length === 0
+  ) {
     item.public_url = record.public_url;
   }
   if (typeof record.shipped_on === "string" && SHIPPED_ON_RE.test(record.shipped_on)) {
