@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
 import { buildActualMetrics, buildEpisodeCandidates, discoverLocalSources, gitAggregateMetrics } from "../src/extractors.ts";
+import { scanProfileForLeaks } from "../src/submit.ts";
 
 function makeTempDir(): string {
   return mkdtempSync(path.join(tmpdir(), "viber-extractors-"));
@@ -13,6 +14,97 @@ function makeTempDir(): string {
 
 function cleanup(dir: string): void {
   rmSync(dir, { recursive: true, force: true });
+}
+
+function sqlString(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+async function startCursorWalDb(root: string, projectPath: string): Promise<{ dbPath: string; close: () => Promise<void> }> {
+  const dbPath = path.join(root, "state.vscdb");
+  const proc = spawn("sqlite3", [dbPath], { stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  proc.stdout.setEncoding("utf8");
+  proc.stderr.setEncoding("utf8");
+  proc.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  proc.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  const ready = new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`sqlite3 WAL fixture did not become ready: ${stderr}`)), 5000);
+    proc.once("exit", (code) => {
+      clearTimeout(timeout);
+      reject(new Error(`sqlite3 WAL fixture exited before ready with code ${code}: ${stderr}`));
+    });
+    const poll = setInterval(() => {
+      if (stdout.includes("__READY__")) {
+        clearTimeout(timeout);
+        clearInterval(poll);
+        resolve();
+      }
+    }, 25);
+  });
+
+  const composer = JSON.stringify({ workspacePath: projectPath });
+  const userBubble = JSON.stringify({
+    type: 1,
+    text: "Use the existing plan, avoid broad refactors, and add tests.",
+    createdAt: "2026-06-09T12:00:00Z",
+    codeBlocks: [],
+  });
+  const assistantBubble = JSON.stringify({
+    type: 2,
+    text: "I will keep the change scoped and verify with tests.",
+    createdAt: "2026-06-09T12:01:00Z",
+    codeBlocks: [{ text: "function example() { return true; }" }],
+  });
+  proc.stdin.write(
+    [
+      "PRAGMA journal_mode=WAL;",
+      "PRAGMA wal_autocheckpoint=0;",
+      "CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value TEXT);",
+      `INSERT INTO cursorDiskKV VALUES('composerData:abc', ${sqlString(composer)});`,
+      `INSERT INTO cursorDiskKV VALUES('bubbleId:abc:1', ${sqlString(userBubble)});`,
+      `INSERT INTO cursorDiskKV VALUES('bubbleId:abc:2', ${sqlString(assistantBubble)});`,
+      ".print __READY__",
+    ].join("\n") + "\n",
+  );
+  await ready;
+
+  return {
+    dbPath,
+    close: async () => {
+      if (proc.exitCode !== null) {
+        return;
+      }
+      try {
+        proc.stdin.end(".exit\n");
+      } catch {
+        // Process may have exited between the exitCode check and stdin write.
+      }
+      await new Promise<void>((resolve) => {
+        const startedAt = Date.now();
+        const timer = setInterval(() => {
+          if (proc.exitCode !== null || Date.now() - startedAt > 1000) {
+            clearInterval(timer);
+            if (proc.exitCode === null) {
+              proc.kill("SIGTERM");
+            }
+            resolve();
+          }
+        }, 25);
+        setTimeout(() => {
+          if (proc.exitCode === null) {
+            proc.kill("SIGTERM");
+          }
+        }, 1000);
+      });
+    },
+  };
 }
 
 test("discovers project-scoped Claude and Codex sessions without leaking paths", () => {
@@ -94,7 +186,6 @@ if (sqliteAvailable) {
         createdAt: "2026-06-09T12:01:00Z",
         codeBlocks: [{ text: "function example() { return true; }" }],
       });
-      const sqlString = (value: string) => `'${value.replace(/'/g, "''")}'`;
       execFileSync("sqlite3", [dbPath], {
         input: [
           "CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value TEXT);",
@@ -115,6 +206,57 @@ if (sqliteAvailable) {
   });
 } else {
   test("extracts Cursor bubble rows from cursorDiskKV in read-only sqlite mode", { skip: "sqlite3 not installed" }, () => {});
+}
+
+if (sqliteAvailable) {
+  test("extracts Cursor rows when cursorDiskKV is visible only through WAL", async () => {
+    const root = makeTempDir();
+    let walDb: { dbPath: string; close: () => Promise<void> } | undefined;
+    try {
+      const projectPath = "/private/project";
+      walDb = await startCursorWalDb(root, projectPath);
+
+      const bundle = buildEpisodeCandidates({ homeDir: root, projectPath, cursorDbPath: walDb.dbPath });
+      assert.equal(bundle.coverage.tools.cursor.session_count, 1);
+      assert.equal(bundle.episode_candidates.length, 1);
+      assert.equal(bundle.episode_candidates[0].signals.code_block_count >= 1, true);
+
+      const actual = buildActualMetrics({ homeDir: root, projectPath, cursorDbPath: walDb.dbPath });
+      assert.equal(actual.vibe_metrics.metrics_coverage.tools.cursor.session_count, 1);
+      assert.equal(actual.vibe_metrics.metrics_coverage.tools.cursor.timestamped_event_count, 2);
+      assert.equal(scanProfileForLeaks(actual).clean, true);
+    } finally {
+      await walDb?.close();
+      cleanup(root);
+    }
+  });
+} else {
+  test("extracts Cursor rows when cursorDiskKV is visible only through WAL", { skip: "sqlite3 not installed" }, () => {});
+}
+
+if (sqliteAvailable) {
+  test("skips Cursor DBs without cursorDiskKV using redaction-safe warnings", () => {
+    const root = makeTempDir();
+    try {
+      const dbPath = path.join(root, "state.vscdb");
+      execFileSync("sqlite3", [dbPath], {
+        input: "CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT);\n",
+      });
+
+      const actual = buildActualMetrics({ homeDir: root, projectPath: "/private/project", cursorDbPath: dbPath });
+      assert.equal(actual.vibe_metrics.metrics_coverage.tools.cursor.session_count, 0);
+      assert.ok(actual.vibe_metrics.warnings.includes("cursor-state-schema-unsupported"));
+      assert.equal(JSON.stringify(actual).includes("cursorDiskKV"), false);
+      assert.equal(scanProfileForLeaks(actual).clean, true);
+
+      const bundle = buildEpisodeCandidates({ homeDir: root, projectPath: "/private/project", cursorDbPath: dbPath });
+      assert.equal(bundle.coverage.tools.cursor.session_count, 0);
+    } finally {
+      cleanup(root);
+    }
+  });
+} else {
+  test("skips Cursor DBs without cursorDiskKV using redaction-safe warnings", { skip: "sqlite3 not installed" }, () => {});
 }
 
 if (sqliteAvailable) {
@@ -192,7 +334,6 @@ if (sqliteAvailable) {
       );
 
       const dbPath = path.join(root, "state.vscdb");
-      const sqlString = (value: string) => `'${value.replace(/'/g, "''")}'`;
       execFileSync("sqlite3", [dbPath], {
         input: [
           "CREATE TABLE cursorDiskKV(key TEXT UNIQUE ON CONFLICT REPLACE, value TEXT);",

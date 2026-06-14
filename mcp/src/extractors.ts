@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -429,6 +429,19 @@ export function discoverLocalSources(options: LocalExtractorOptions = {}): Local
   };
 }
 
+function publicWarnings(warnings: string[]): string[] {
+  const normalized = warnings.flatMap((warning) => {
+    const base = warning.split(":", 1)[0] ?? "";
+    const code = base
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 120);
+    return code ? [code] : [];
+  });
+  return Array.from(new Set(normalized));
+}
+
 export function buildActualMetrics(options: LocalExtractorOptions = {}): ActualMetricsBundle {
   const context = createExtractorContext(options);
   const rawCollectors = [
@@ -447,7 +460,7 @@ export function buildActualMetrics(options: LocalExtractorOptions = {}): ActualM
   }));
   const profileAnalysisOverhead = buildProfileAnalysisOverhead(rawCollectors);
   const gitMetrics = gitAggregateMetrics(options);
-  const warnings = [...collectors.flatMap((collector) => collector.warnings), ...gitMetrics.warnings];
+  const warnings = publicWarnings([...collectors.flatMap((collector) => collector.warnings), ...gitMetrics.warnings]);
   const allSessions = collectors.flatMap((collector) => collector.sessions);
   const allTimestamps = allSessions.flatMap((session) => session.timestampMs);
   const coverageTools = Object.fromEntries(
@@ -471,7 +484,7 @@ export function buildActualMetrics(options: LocalExtractorOptions = {}): ActualM
           ...activityWindowFields(toolTimestamps),
           token_source: tokenSource,
           ...(usage.total > 0 ? { total_tokens: usage.total } : {}),
-          warnings: collector.warnings,
+          warnings: publicWarnings(collector.warnings),
         } satisfies ActualMetricsToolCoverage,
       ];
     }),
@@ -1541,42 +1554,49 @@ function collectActualCursorMetrics(context: ExtractorContext): ActualCollectorR
   const seenComposers = new Set<string>();
   const sessions: ActualSessionMetric[] = [];
   for (const dbPath of dbPaths) {
-    const dbUri = `${pathToFileURL(dbPath).href}?mode=ro&immutable=1`;
-    const composerSql = [
-      "SELECT key FROM cursorDiskKV",
-      "WHERE key >= 'composerData:' AND key < 'composerData;'",
-      projectClauses ? `AND (${projectClauses})` : "",
-      "ORDER BY key;",
-    ].join(" ");
-    const composerKeys = queryCursorKeys(context.sqlitePath, dbUri, composerSql, warnings);
-    for (const key of composerKeys) {
-      const composerId = key.slice("composerData:".length);
-      if (!composerId || seenComposers.has(composerId)) {
-        continue;
-      }
-      seenComposers.add(composerId);
-      const startKey = `bubbleId:${composerId}:`;
-      const endKey = `bubbleId:${composerId};`;
-      const bubbleSql = [
-        "SELECT json_extract(CAST(value AS TEXT), '$.createdAt') AS created_at,",
-        "json_extract(CAST(value AS TEXT), '$.tokenCount') AS token_count,",
-        "json_extract(CAST(value AS TEXT), '$.type') AS bubble_type,",
-        "substr(json_extract(CAST(value AS TEXT), '$.text'), 1, 2000) AS bubble_text FROM cursorDiskKV",
-        `WHERE key >= ${sqlLiteral(startKey)} AND key < ${sqlLiteral(endKey)}`,
+    const handle = prepareCursorDbForRead(context.sqlitePath, dbPath, warnings);
+    if (!handle) {
+      continue;
+    }
+    try {
+      const composerSql = [
+        "SELECT key FROM cursorDiskKV",
+        "WHERE key >= 'composerData:' AND key < 'composerData;'",
+        projectClauses ? `AND (${projectClauses})` : "",
         "ORDER BY key;",
       ].join(" ");
-      const bubbles = queryCursorBubbleMetrics(context.sqlitePath, dbUri, bubbleSql, warnings);
-      if (bubbles.timestampMs.length === 0) {
-        continue;
+      const composerKeys = queryCursorKeys(context.sqlitePath, handle.dbUri, composerSql, warnings);
+      for (const key of composerKeys) {
+        const composerId = key.slice("composerData:".length);
+        if (!composerId || seenComposers.has(composerId)) {
+          continue;
+        }
+        seenComposers.add(composerId);
+        const startKey = `bubbleId:${composerId}:`;
+        const endKey = `bubbleId:${composerId};`;
+        const bubbleSql = [
+          "SELECT json_extract(CAST(value AS TEXT), '$.createdAt') AS created_at,",
+          "json_extract(CAST(value AS TEXT), '$.tokenCount') AS token_count,",
+          "json_extract(CAST(value AS TEXT), '$.type') AS bubble_type,",
+          "substr(json_extract(CAST(value AS TEXT), '$.text'), 1, 2000) AS bubble_text FROM cursorDiskKV",
+          `WHERE key >= ${sqlLiteral(startKey)} AND key < ${sqlLiteral(endKey)}`,
+          "ORDER BY key;",
+        ].join(" ");
+        const bubbles = queryCursorBubbleMetrics(context.sqlitePath, handle.dbUri, bubbleSql, warnings);
+        if (bubbles.timestampMs.length === 0) {
+          continue;
+        }
+        const usage = sumTokenUsage(bubbles.tokenEvents.map((event) => event.usage));
+        sessions.push({
+          tool: "cursor",
+          timestampMs: bubbles.timestampMs,
+          ...(usage.total > 0 ? { tokenUsage: usage } : {}),
+          ...(bubbles.tokenEvents.length > 0 ? { tokenEvents: bubbles.tokenEvents } : {}),
+          measurement: isMeasurementPrompt(bubbles.firstUserText),
+        });
       }
-      const usage = sumTokenUsage(bubbles.tokenEvents.map((event) => event.usage));
-      sessions.push({
-        tool: "cursor",
-        timestampMs: bubbles.timestampMs,
-        ...(usage.total > 0 ? { tokenUsage: usage } : {}),
-        ...(bubbles.tokenEvents.length > 0 ? { tokenEvents: bubbles.tokenEvents } : {}),
-        measurement: isMeasurementPrompt(bubbles.firstUserText),
-      });
+    } finally {
+      handle.cleanup?.();
     }
   }
   const hasTokens = sessions.some((session) => session.tokenUsage && session.tokenUsage.total > 0);
@@ -1611,6 +1631,77 @@ function cursorDbCandidates(context: ExtractorContext): string[] {
     candidates.push(context.cursorDbPath);
   }
   return candidates;
+}
+
+interface CursorDbReadHandle {
+  dbUri: string;
+  cleanup?: () => void;
+}
+
+function prepareCursorDbForRead(sqlitePath: string, dbPath: string, warnings: string[]): CursorDbReadHandle | null {
+  const immutableUri = `${pathToFileURL(dbPath).href}?mode=ro&immutable=1`;
+  const immutableTableState = cursorDiskKvTableState(sqlitePath, immutableUri);
+  if (immutableTableState === "present") {
+    return { dbUri: immutableUri };
+  }
+  if (immutableTableState === "error") {
+    warnings.push("cursor_sqlite_query_failed");
+    return null;
+  }
+
+  const walPath = `${dbPath}-wal`;
+  if (!existsSync(walPath)) {
+    warnings.push("cursor_state_schema_unsupported");
+    return null;
+  }
+
+  const scratchDir = mkdtempSync(path.join(tmpdir(), "viber-cursor-db-"));
+  const scratchDbPath = path.join(scratchDir, "state.vscdb");
+  try {
+    copyFileSync(dbPath, scratchDbPath);
+    copyFileSync(walPath, `${scratchDbPath}-wal`);
+    // Do not copy the live -shm lock file; SQLite can create scratch-local
+    // shared memory while replaying the copied WAL.
+    const walAwareUri = `${pathToFileURL(scratchDbPath).href}?mode=ro`;
+    const walAwareTableState = cursorDiskKvTableState(sqlitePath, walAwareUri);
+    if (walAwareTableState === "present") {
+      return {
+        dbUri: walAwareUri,
+        cleanup: () => {
+          rmSync(scratchDir, { recursive: true, force: true });
+        },
+      };
+    }
+    warnings.push(walAwareTableState === "error" ? "cursor_sqlite_query_failed" : "cursor_state_schema_unsupported");
+    rmSync(scratchDir, { recursive: true, force: true });
+    return null;
+  } catch {
+    warnings.push("cursor_sqlite_query_failed");
+    rmSync(scratchDir, { recursive: true, force: true });
+    return null;
+  }
+}
+
+function cursorDiskKvTableState(sqlitePath: string, dbUri: string): "present" | "missing" | "error" {
+  try {
+    const output = execFileSync(
+      sqlitePath,
+      [
+        "-readonly",
+        "-json",
+        dbUri,
+        "SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = 'cursorDiskKV' LIMIT 1;",
+      ],
+      {
+        encoding: "utf8",
+        maxBuffer: 1024 * 1024,
+      },
+    );
+    const parsed = JSON.parse(output || "[]") as Array<{ found?: unknown }>;
+    return parsed.some((row) => row.found === 1 || row.found === "1") ? "present" : "missing";
+  } catch {
+    return "error";
+  }
 }
 
 function queryCursorBubbleMetrics(
@@ -2316,58 +2407,65 @@ function collectCursorSessions(context: ExtractorContext): CollectorResult {
   const seenComposers = new Set<string>();
 
   for (const dbPath of dbPaths) {
-    const dbUri = `${pathToFileURL(dbPath).href}?mode=ro&immutable=1`;
-    const composerSql = [
-      "SELECT key, substr(CAST(value AS TEXT), 1, 50000) AS value FROM cursorDiskKV",
-      "WHERE key LIKE 'composerData:%'",
-      projectClauses ? `AND (${projectClauses})` : "",
-      "ORDER BY key LIMIT 200;",
-    ].join(" ");
-    const composerRows = queryCursorRows(context.sqlitePath, dbUri, composerSql, warnings);
-
-    const projectComposerIds = new Set<string>();
-    const projectBubbleIds = new Set<string>();
-    for (const row of composerRows) {
-      const key = String(row.key ?? "");
-      if (!key.startsWith("composerData:")) {
-        continue;
-      }
-      const composerId = key.slice("composerData:".length);
-      if (!composerId || seenComposers.has(composerId)) {
-        continue;
-      }
-      const value = parseMaybeJson(row.value);
-      if (cursorComposerMatchesProject(value, context.selectedProjectPath)) {
-        seenComposers.add(composerId);
-        projectComposerIds.add(composerId);
-        collectCursorBubbleIds(value).forEach((bubbleId) => projectBubbleIds.add(bubbleId));
-        const sessionKey = `cursor:${composerId}`;
-        const composerSignals = signalsByKey.get(sessionKey) ?? emptySessionSignals();
-        collectCursorComposerSignals(composerSignals, value);
-        signalsByKey.set(sessionKey, composerSignals);
-      }
+    const handle = prepareCursorDbForRead(context.sqlitePath, dbPath, warnings);
+    if (!handle) {
+      continue;
     }
-
-    const bubbleRows: Array<{ key: string; value: unknown }> = [];
-    for (const composerId of projectComposerIds) {
-      const sql = [
+    try {
+      const composerSql = [
         "SELECT key, substr(CAST(value AS TEXT), 1, 50000) AS value FROM cursorDiskKV",
-        `WHERE key LIKE ${sqlLiteral(`bubbleId:${composerId}:%`)}`,
-        "ORDER BY key LIMIT 2000;",
+        "WHERE key LIKE 'composerData:%'",
+        projectClauses ? `AND (${projectClauses})` : "",
+        "ORDER BY key LIMIT 200;",
       ].join(" ");
-      bubbleRows.push(...queryCursorRows(context.sqlitePath, dbUri, sql, warnings));
+      const composerRows = queryCursorRows(context.sqlitePath, handle.dbUri, composerSql, warnings);
+
+      const projectComposerIds = new Set<string>();
+      const projectBubbleIds = new Set<string>();
+      for (const row of composerRows) {
+        const key = String(row.key ?? "");
+        if (!key.startsWith("composerData:")) {
+          continue;
+        }
+        const composerId = key.slice("composerData:".length);
+        if (!composerId || seenComposers.has(composerId)) {
+          continue;
+        }
+        const value = parseMaybeJson(row.value);
+        if (cursorComposerMatchesProject(value, context.selectedProjectPath)) {
+          seenComposers.add(composerId);
+          projectComposerIds.add(composerId);
+          collectCursorBubbleIds(value).forEach((bubbleId) => projectBubbleIds.add(bubbleId));
+          const sessionKey = `cursor:${composerId}`;
+          const composerSignals = signalsByKey.get(sessionKey) ?? emptySessionSignals();
+          collectCursorComposerSignals(composerSignals, value);
+          signalsByKey.set(sessionKey, composerSignals);
+        }
+      }
+
+      const bubbleRows: Array<{ key: string; value: unknown }> = [];
+      for (const composerId of projectComposerIds) {
+        const sql = [
+          "SELECT key, substr(CAST(value AS TEXT), 1, 50000) AS value FROM cursorDiskKV",
+          `WHERE key LIKE ${sqlLiteral(`bubbleId:${composerId}:%`)}`,
+          "ORDER BY key LIMIT 2000;",
+        ].join(" ");
+        bubbleRows.push(...queryCursorRows(context.sqlitePath, handle.dbUri, sql, warnings));
+      }
+      const bubbleIdList = Array.from(projectBubbleIds).slice(0, 5000);
+      for (let index = 0; index < bubbleIdList.length; index += 250) {
+        const chunk = bubbleIdList.slice(index, index + 250);
+        const sql = [
+          "SELECT key, substr(CAST(value AS TEXT), 1, 50000) AS value FROM cursorDiskKV",
+          `WHERE key IN (${chunk.map((bubbleId) => sqlLiteral(`bubbleId:${bubbleId}`)).join(",")})`,
+          "ORDER BY key;",
+        ].join(" ");
+        bubbleRows.push(...queryCursorRows(context.sqlitePath, handle.dbUri, sql, warnings));
+      }
+      appendCursorBubbleEvents(context, bubbleRows, projectComposerIds, sessionsByKey, signalsByKey, droppedReasons, true);
+    } finally {
+      handle.cleanup?.();
     }
-    const bubbleIdList = Array.from(projectBubbleIds).slice(0, 5000);
-    for (let index = 0; index < bubbleIdList.length; index += 250) {
-      const chunk = bubbleIdList.slice(index, index + 250);
-      const sql = [
-        "SELECT key, substr(CAST(value AS TEXT), 1, 50000) AS value FROM cursorDiskKV",
-        `WHERE key IN (${chunk.map((bubbleId) => sqlLiteral(`bubbleId:${bubbleId}`)).join(",")})`,
-        "ORDER BY key;",
-      ].join(" ");
-      bubbleRows.push(...queryCursorRows(context.sqlitePath, dbUri, sql, warnings));
-    }
-    appendCursorBubbleEvents(context, bubbleRows, projectComposerIds, sessionsByKey, signalsByKey, droppedReasons, true);
   }
 
   if (sessionsByKey.size === 0) {
@@ -2375,17 +2473,24 @@ function collectCursorSessions(context: ExtractorContext): CollectorResult {
     // project-scoped bubble text directly (legacy stores).
     warnings.push("cursor_project_scope_inferred_from_bubble_text_or_skipped");
     for (const dbPath of dbPaths) {
-      const dbUri = `${pathToFileURL(dbPath).href}?mode=ro&immutable=1`;
-      const bubbleFallbackSql = [
-        "SELECT key, substr(CAST(value AS TEXT), 1, 50000) AS value FROM cursorDiskKV",
-        "WHERE key LIKE 'bubbleId:%'",
-        projectClauses ? `AND (${projectClauses})` : "",
-        "ORDER BY key LIMIT 200;",
-      ].join(" ");
-      const rows = queryCursorRows(context.sqlitePath, dbUri, bubbleFallbackSql, warnings);
-      appendCursorBubbleEvents(context, rows, new Set(), sessionsByKey, signalsByKey, droppedReasons, false);
-      if (sessionsByKey.size > 0) {
-        break;
+      const handle = prepareCursorDbForRead(context.sqlitePath, dbPath, warnings);
+      if (!handle) {
+        continue;
+      }
+      try {
+        const bubbleFallbackSql = [
+          "SELECT key, substr(CAST(value AS TEXT), 1, 50000) AS value FROM cursorDiskKV",
+          "WHERE key LIKE 'bubbleId:%'",
+          projectClauses ? `AND (${projectClauses})` : "",
+          "ORDER BY key LIMIT 200;",
+        ].join(" ");
+        const rows = queryCursorRows(context.sqlitePath, handle.dbUri, bubbleFallbackSql, warnings);
+        appendCursorBubbleEvents(context, rows, new Set(), sessionsByKey, signalsByKey, droppedReasons, false);
+        if (sessionsByKey.size > 0) {
+          break;
+        }
+      } finally {
+        handle.cleanup?.();
       }
     }
   }
@@ -2707,7 +2812,7 @@ function queryCursorRows(
       typeof row.key === "string" ? [{ key: row.key, value: row.value }] : [],
     );
   } catch (cause) {
-    warnings.push(`cursor_sqlite_query_failed:${cause instanceof Error ? cause.message : String(cause)}`);
+    warnings.push("cursor_sqlite_query_failed");
     return [];
   }
 }
