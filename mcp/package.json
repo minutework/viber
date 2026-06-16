@@ -16,7 +16,7 @@
     "schema"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node ./scripts/copy-schema.mjs",
+    "build": "tsc -p tsconfig.build.json && node ./scripts/copy-schema.mjs && node ./scripts/fix-bin-mode.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test tests/*.test.ts"
