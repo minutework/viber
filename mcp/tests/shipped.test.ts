@@ -10,7 +10,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { buildShippedAggregate, detectShippedCandidates } from "../src/shipped.ts";
+import { detectShippedTitleViolations } from "../src/redaction.ts";
+import { buildShippedAggregate, defaultItemForCandidate, detectShippedCandidates, sanitizeShippedTitle } from "../src/shipped.ts";
 
 function makeTempDir(): string {
   return mkdtempSync(path.join(tmpdir(), "viber-shipped-"));
@@ -97,6 +98,30 @@ test("detects per-repo per-month candidates from release tags, deploy paths, and
   } finally {
     cleanup(root);
   }
+});
+
+test("default shipped titles strip conventional-commit scopes and route fragments", () => {
+  const title = sanitizeShippedTitle(
+    "minutework-mono: feat(mw-public-next): developer site + docs (/developer, /docs)",
+    "minutework-mono 2026-05",
+  );
+  assert.equal(title, "minutework-mono - developer site + docs");
+  assert.equal(title.includes("("), false);
+  assert.equal(title.includes(")"), false);
+  assert.equal(title.includes("/"), false);
+  assert.deepEqual(detectShippedTitleViolations(title), []);
+
+  const item = defaultItemForCandidate({
+    source_key: "local/minutework-mono:2026-05",
+    repo_label: "minutework-mono",
+    period: "2026-05",
+    categories: ["feature"],
+    evidence: ["git_evidence"],
+    commit_count: 4,
+    suggested_title: "minutework-mono: feat(mw-public-next): developer site + docs (/developer, /docs)",
+  });
+  assert.equal(item.title, "minutework-mono - developer site + docs");
+  assert.deepEqual(detectShippedTitleViolations(item.title), []);
 });
 
 test("detection is deterministic across runs", () => {

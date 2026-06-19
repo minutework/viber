@@ -4,7 +4,7 @@ description: >-
   Analyze your local coding-agent transcripts (Claude + Codex + Cursor)
   for ONE chosen project and produce a Verifiable AI-Builder Profile: per-episode,
   rubric-scored, double-redacted, integrity-signed by the public-dj proxy, and
-  submitted as a single schema-valid JSON via the viber-mcp submit_profile tool.
+  submitted as a single schema-valid JSON via the viber-mcp score_and_submit_profile tool.
   Optionally attaches consented repo-architecture scorecards (numbers/booleans/enums
   plus two paraphrased notes per repo) for repositories the user explicitly selected.
   Raw transcripts and source code NEVER leave the machine.
@@ -16,7 +16,7 @@ rubric_version: "1.1.0"
 
 You are running **inside the user's own coding agent, on the user's own subscription**,
 to analyze their coding-agent transcripts and emit a single, schema-valid **profile JSON**.
-You then submit that profile through the `viber-mcp` `submit_profile` tool. **Nothing else
+You then submit that profile through the `viber-mcp` `score_and_submit_profile` tool. **Nothing else
 leaves the machine.** The contract you must honor exactly:
 
 - Allowlist: `schema/profile.schema.json` (hard `additionalProperties:false` everywhere).
@@ -69,14 +69,17 @@ ORCHESTRATOR  → discover + normalize transcripts, pick ONE project, segment EP
      ├─ WORKERS (bounded parallel)  → per-episode signals + ≥2 redacted evidence excerpts
      │                                + per-dimension mini-scores (omit axes with no evidence)
      │
-     ├─ SCORING via PROXY  → route each episode's {episode_id, type, scores} digest through
-     │                       the public-dj scoring proxy; collect the signed integrity nonce
-     │
      ├─ SYNTHESIZER  → aggregate per rubric §4 (evidence-weighted), pick strongest excerpts,
      │                 derive archetype / strengths / growth edges (anti-halo)
      │
-     └─ VALIDATOR  → assemble the schema-valid profile, run BOTH redaction layers over every
-                     text field fail-closed, then call viber-mcp submit_profile
+     ├─ PROFILE DRAFT  → assemble every profile field except final proxy-returned episode_scores
+     │                    BEFORE finalization
+     │
+     ├─ SCORING via PROXY  → route each episode's {episode_id, type, scores} digest through
+     │                       the public-dj scoring proxy; collect the signed integrity nonce
+     │
+     └─ VALIDATOR  → run BOTH redaction layers over every text field fail-closed inside
+                      viber-mcp score_and_submit_profile
 ```
 
 Run the whole thing **read-only / least-privilege**: read agent-transcript files and run
@@ -114,8 +117,8 @@ Start with the local-only `viber-mcp` helpers when available:
 7. `get_shipped_with_ai()` — the user's CLI-approved `shipped_with_ai` block, or `null` when
    nothing was approved. Verbatim-or-omit only; see §8.
 
-These tools send nothing over the network. Use their output as evidence discovery inputs; still
-paraphrase excerpts before final submission and score final episodes through `score_episodes`.
+These discovery tools send nothing over the network. Use their output as evidence discovery inputs; still
+paraphrase excerpts before final submission and finalize through `score_and_submit_profile`.
 The `behavior_signals` block is a LOCAL analysis input only — never copy it into the submitted
 profile (no schema field accepts it).
 
@@ -214,16 +217,21 @@ headline numbers are server-attested, not client-asserted. For each episode:
    mini-scores). Compute `digest = base64url(SHA-256(JCS({episode_id, type, scores})))`, where
    **JCS = RFC 8785 canonical JSON** (sorted keys, no whitespace). The digest is unpadded
    base64url, exactly 43 chars.
-2. Send the **redacted episode digest payload** (digest + the scores + a small amount of
-   already-redacted evidence the proxy needs to confirm scoring) to the proxy endpoint
-   `POST {public-dj}/api/v1/builder-profiles/score/`. Only redacted digests/evidence reach the
-   proxy — never raw transcript.
-3. The proxy returns the authoritative scores plus a **signed nonce**:
+2. Assemble the complete profile draft in memory with every field except the final
+   proxy-returned `episode_scores`. This keeps the short-lived scoring token window tight:
+   after this point, do not analyze, re-read, or synthesize.
+3. Call `score_and_submit_profile({ profile, episodes })` exactly once. The MCP tool
+   deterministically freezes one submission token, sends the **redacted episode digest payload**
+   (digest + the scores + a small amount of already-redacted evidence) to public-dj scoring,
+   attaches every returned scored episode exactly once as `profile.episode_scores`, validates
+   schema/redaction, and immediately submits with the same token. Only redacted digests/evidence
+   and the final allowlisted profile reach public-dj — never raw transcript.
+4. The proxy returns the authoritative scores plus a **signed nonce**:
    `{ request_id, signature, digest, issued_at }` where
    `signature = base64url(HMAC-SHA256(server_key, request_id ‖ handle ‖ digest ‖
    canonical_scores))` and `handle` is the verified submission-token handle (binds the nonce
    to the submitter → no cross-account replay). Attach this nonce to the episode.
-4. **An episode can only appear in `episode_scores` if the proxy scored it and returned a
+5. **An episode can only appear in `episode_scores` if the proxy scored it and returned a
    nonce** (`nonce` is required). Unscored episodes are simply **absent**, never submitted
    unverified.
 
@@ -469,10 +477,13 @@ Two related deterministic notes:
   digest cache in `VIBER_SCRATCH_DIR`) may persist between runs — they store ONLY salted
   digests, file mtime fingerprints keyed by salted path digests, and already-redacted derived
   outputs; never raw transcript text or paths.
-- If the proxy or submit call fails transiently, you may **retry/replay**: re-send the same
-  episode digests (idempotent — the proxy keys on `request_id`/digest) and re-attempt
-  `submit_profile`. Never fabricate a nonce to "fill in" a failed episode; an episode without a
-  real proxy nonce is simply omitted.
+- If the proxy or submit call fails transiently, you may **retry/replay** by calling
+  `score_and_submit_profile` again with the same profile draft and redacted episode inputs.
+  The MCP scoring cache is token-fingerprint scoped and stores only digests plus redacted nonce
+  responses. Never fabricate a nonce to "fill in" a failed episode.
+- Do not call `score_episodes` and `submit_profile` separately during upload.sh runs.
+  `score_and_submit_profile` owns the transactional score → attach all scored episodes → submit
+  step so the local agent cannot loop, omit episodes, or miss the short-lived token window.
 - The submission is **append-only**: re-running regenerates and replaces; there is no edit path.
 
 ---
@@ -520,9 +531,10 @@ other). Before calling the MCP:
    (m) `combined_score == round(0.65 × overall_score + 0.35 × portfolio.mean_overall)`,
    `combined_grade` matches its band, and both appear only alongside `repo_architecture`.
 4. Call **`analysis_manifest()`** to confirm `schema_version`/`rubric_version` and the exact
-   allowlist, then call **`submit_profile({ profile })`**.
-   - For a preview, run with `--dry-run` (or pass `dry_run: true`): the tool validates against
-     `schema/profile.schema.json` (ajv) and **prints the exact payload, sending nothing**.
+   allowlist before finalization. Then call **`score_and_submit_profile({ profile, episodes })`**
+   with the complete profile draft and redacted episode scoring inputs.
+   - For a preview, run with `--dry-run` (or pass `dry_run: true`): the tool produces and
+     validates the exact final payload, but does not ingest the profile.
    - On a live run the tool POSTs the profile to public-dj ingest with the submission token.
      public-dj independently re-validates the schema, re-runs both redactors (rejecting on any
      hit), verifies every nonce, recomputes all aggregates, and stores an append-only snapshot.
